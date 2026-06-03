@@ -8,6 +8,23 @@
 #define MIN_NE 1e-8
 #define SMALL_NUM 1e-20
 
+/* Function multi-versioning for the painter routines that call exp/log
+   (forward/backward inner loops, deltaLiStephens, sampler). When the
+   toolchain supports it (CP_USE_FMV, set by configure on ELF x86 with a
+   compiler that accepts target_clones), the compiler emits a baseline x86-64
+   clone plus an AVX2 clone, and a glibc IFUNC resolver selects at load time.
+   The AVX2 clone is where the vectorizer emits libmvec exp/log (under the
+   TU-wide -ffast-math), so a single binary stays runnable on any x86-64 yet
+   runs the fast path on AVX2+ CPUs. Without FMV support the macro is empty:
+   one portable version using scalar libm (correct everywhere, just not
+   accelerated). --enable-native instead tunes the whole TU and does not
+   define CP_USE_FMV. */
+#if defined(CP_USE_FMV) && defined(__ELF__) && (defined(__x86_64__) || defined(__i386__))
+#  define CP_FMV __attribute__((target_clones("avx2","default")))
+#else
+#  define CP_FMV
+#endif
+
 ///////////////////////////////////////
 ///////////////////////////////////////
 // Sampler
@@ -27,6 +44,7 @@ double thetaLiStephens(double * MutProb_vec, int *p_nchr,int *p_Nhaps){
   return(Theta);
 }
 
+CP_FMV
 double deltaLiStephens(double * TransProb, double * pos, double p_rhobar, double * lambda, int *p_Nloci,struct param_t *Par){
   double delta = 1.0;
   int locus;
@@ -67,6 +85,7 @@ double InitialiseForward(signed char * newh, signed char ** existing_h, double *
   return(Alphasum);
 }
 
+CP_FMV
 double forwardAlgorithm(signed char * newh, signed char ** existing_h, double ** Alphamat, double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob, double * copy_probSTART, double * TransProb, struct param_t *Par) {
 //double forwardAlgorithm(struct_t *Fb, struct param_t *Par){
   // Perform the forward step
@@ -159,6 +178,7 @@ double forwardAlgorithm(signed char * newh, signed char ** existing_h, double **
 ///////////////////////////////////////////////
 // Backwards algorithm
 
+CP_FMV
 void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,double p_rhobar, double * N_e_new,signed char * newh, signed char ** existing_h, double ** Alphamat, double * lambda, double delta,double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob,double * copy_prob_new,double * copy_prob_newSTART, double *corrected_chunk_count, double *expected_chunk_length, double * expected_differences,double *regional_chunk_count_sum_final,double *regional_chunk_count_sum_squared_final, int *num_regions, double * copy_probSTART, double * TransProb,int * pop_vec,double *pos, double * snp_info_measure, struct files_t *Outfiles, struct param_t *Par){
 
   double total_regional_chunk_count,total_gen_dist;
@@ -380,6 +400,7 @@ void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,
 }
 
 ///////////////////////////////////////////////
+CP_FMV
 double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char ** existing_h, int *p_Nloci, int *p_Nhaps, int *p_nchr, double p_rhobar, double * MutProb_vec, int * allelic_type_count_vec, double * lambda, double * pos, double * copy_prob, double * copy_probSTART, int * pop_vec, int * cond_mat_haplotypes,int ndonorpops, int run_num, int ind_val, struct files_t *Outfiles, struct param_t *Par)
 {
 

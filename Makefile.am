@@ -31,27 +31,33 @@ all_SOURCES = fsproject.h fsproject.cpp fssettings.h fssettings.cpp fsutils.h fs
 fs_SOURCES = fs.cpp $(all_SOURCES)
 mixPainter_SOURCES = badpainter.cpp $(all_SOURCES)
 
-## ChromoPainterSampler.c is compiled here with -ffast-math so GCC emits
-## vectorized libm (libmvec) for the per-locus exp()/log(): ~12% faster at
+## ChromoPainterSampler.c is compiled here with -ffast-math so the vectorizer
+## can emit libmvec exp()/log() for the per-locus inner loops: ~12% faster at
 ## 4 threads (chr11 EUR panel). Output is identical at the printed
 ## (calibration) precision -- chunkcounts/chunklengths md5 match the
-## non-fast-math build. (Raw doubles already vary ~1e-13 across thread
-## counts on this base from the OpenMP reduction combine order; this PR
-## doesn't change that, and stacks cleanly on the deterministic-sum PR,
-## which makes it exact.)
+## non-fast-math build. (Raw doubles already vary ~1e-13 across thread counts
+## on this base from the OpenMP reduction combine order; this PR doesn't change
+## that, and stacks cleanly on the deterministic-sum PR, which makes it exact.)
 ##
-## Scoped to this single TU via a convenience library so the rest of fs
-## (e.g. finestructure inference) is untouched. NOTE: $(OPTIMIZATION)
-## already enables -funsafe-math-optimizations everywhere, so the baseline
-## is not strict IEEE; the delta here is the rest of -ffast-math -- chiefly
-## -ffinite-math-only, which is what lets GCC emit the libmvec clones. The
-## NaN/Inf likelihood guard lives in a separate non-fast-math TU
-## (cp/ChromoPainterFinite.c: cp_bad_value) so -ffinite-math-only can't
-## fold it away. @PAINTER_MARCH@ is the widest AVX ISA configure found the
-## compiler to accept (>= AVX2 is needed for the exp/log clones), else empty.
+## Scoped to this single TU via a convenience library so the rest of fs (e.g.
+## finestructure inference) is untouched. NOTE: $(OPTIMIZATION) already enables
+## -funsafe-math-optimizations everywhere, so the baseline is not strict IEEE;
+## the delta here is the rest of -ffast-math -- chiefly -ffinite-math-only,
+## which is what lets the vectorizer call the libmvec clones. The NaN/Inf
+## likelihood guard lives in a separate non-fast-math TU
+## (cp/ChromoPainterFinite.c: cp_bad_value) so -ffinite-math-only can't fold it
+## away.
+##
+## CPU targeting (see configure.ac): @PAINTER_FMV@ is -DCP_USE_FMV when the
+## toolchain supports function multi-versioning -- the hot forward/backward
+## routines then get a baseline + AVX2 clone with load-time IFUNC dispatch, so
+## one PORTABLE binary runs anywhere yet takes the AVX2 (libmvec) path on
+## capable CPUs. No TU-wide -march, so nothing here can SIGILL on an old CPU.
+## @PAINTER_MARCH@ is empty by default and becomes -march=native only under
+## ./configure --enable-native (build host == run host; not portable).
 noinst_LIBRARIES = libcppaint.a
 libcppaint_a_SOURCES = cp/ChromoPainterSampler.c
-libcppaint_a_CFLAGS = $(OPTIMIZATION) -ffast-math @PAINTER_MARCH@
+libcppaint_a_CFLAGS = $(OPTIMIZATION) -ffast-math @PAINTER_MARCH@ @PAINTER_FMV@
 fs_LDADD = libcppaint.a
 mixPainter_LDADD = libcppaint.a
 
