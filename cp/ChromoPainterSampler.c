@@ -42,7 +42,77 @@ double deltaLiStephens(double * TransProb, double * pos, double p_rhobar, double
   return(delta);
 }
 
-double InitialiseForward(signed char * newh, signed char ** existing_h, double ** Alphamat, double * MutProb_vec, int *p_Nhaps,int *p_Nloci, double * copy_probSTART, double * TransProb) {
+/* ---- Alphamat checkpointing (memory: O(sqrt(Nloci)*Nhaps) not O(Nloci*Nhaps)) ----
+   The forward matrix Alphamat is ~24 GB/chrom and is the dominant RSS. The
+   backward pass only needs columns L and L+1 as it sweeps L downward, so we
+   store only every K-th forward column (a "checkpoint") plus its Alphasum,
+   and recompute each K-block on demand during the backward sweep. Recompute
+   is bit-exact because forward_one_locus() is deterministic (fixed-order sum;
+   see the deterministic-reduction change). Used only when samplesTOT==0
+   (the calibration path); -s>0 sampling keeps the full Alphamat (cx==NULL). */
+struct CkptCtx {
+  double * cols;       /* ncp * Nhaps : the checkpoint columns           */
+  double * asum;       /* ncp         : Alphasum at each checkpoint locus */
+  long     K;          /* checkpoint / block stride                       */
+  long     Nloci;
+  int      Nhaps;
+  double **blk;        /* (K+1) row pointers into blk_store               */
+  double * blk_store;  /* (K+1) * Nhaps : recomputed current block        */
+  double * anew;       /* Nhaps scratch for the deterministic sum         */
+  long     cur_base;   /* first locus currently held in blk (-1 = none)   */
+};
+
+/* One deterministic forward step: write column `cur` from column `prev`,
+   return the new Alphasum. Identical arithmetic to the inline forward loop,
+   so a recomputed column equals the originally-computed one bit-for-bit. */
+static double forward_one_locus(int locus, int Nhaps, int Nloci,
+    double Alphasum_prev, const double *prev, double *cur, double *anew,
+    const signed char *newh, signed char **existing_h, const double *MutProb_vec,
+    const double *copy_prob, const double *TransProb) {
+  double large_num = -1.0 * Alphasum_prev, ObsStateProb, Alphasumnew = 0.0;
+  int i;
+#pragma omp parallel for private(ObsStateProb) schedule(static)
+  for (i = 0; i < Nhaps; i++) {
+    if (newh[locus] == 9) { ObsStateProb = 1.0; }
+    else if (newh[locus] == 8) { ObsStateProb = (1-SMALL_NUM)*(newh[locus]==existing_h[i][locus]) + SMALL_NUM*(newh[locus]!=existing_h[i][locus]); }
+    else { ObsStateProb = (1-MutProb_vec[i])*(newh[locus]==existing_h[i][locus]) + MutProb_vec[i]*(newh[locus]!=existing_h[i][locus]); }
+    double Anew = ObsStateProb*copy_prob[i] + ObsStateProb*(1-TransProb[locus-1])*exp(prev[i]+large_num);
+    cur[i] = log(Anew) - large_num;
+    anew[i] = Anew;
+  }
+  double tp = (locus < (Nloci - 1)) ? TransProb[locus] : 1.0;  /* *1.0 exact (IEEE-754) */
+  for (i=0;i<Nhaps;i++) Alphasumnew += anew[i]*tp;
+  return log(Alphasumnew) - large_num;
+}
+
+/* Recompute block m (columns [m*K .. min((m+1)*K, Nloci-1)]) into cx->blk,
+   seeded from checkpoint m. After this, cx->blk[c - m*K] == Alphamat[c]. */
+static void ckpt_load_block(struct CkptCtx *cx, long m, const signed char *newh,
+    signed char **existing_h, const double *MutProb_vec, const double *copy_prob,
+    const double *TransProb) {
+  long base = m * cx->K;
+  long top  = base + cx->K; if (top > cx->Nloci - 1) top = cx->Nloci - 1;
+  memcpy(cx->blk[0], cx->cols + m * (long)cx->Nhaps, (size_t)cx->Nhaps * sizeof(double));
+  /* Gap recompute: the block's boundary columns (base and base+K) are stored
+     checkpoints, so copy base+K from storage and recompute only the K-1
+     interior columns. This is what makes the stride a memory<->recompute
+     knob -- smaller K stores more boundaries and recomputes fewer columns.
+     The last (partial) block has no next checkpoint, so recompute to top. */
+  long recompute_to = top;
+  if (base + cx->K <= cx->Nloci - 1) {
+    memcpy(cx->blk[cx->K], cx->cols + (m + 1) * (long)cx->Nhaps, (size_t)cx->Nhaps * sizeof(double));
+    recompute_to = base + cx->K - 1;
+  }
+  double asum = cx->asum[m];
+  long c;
+  for (c = base + 1; c <= recompute_to; c++)
+    asum = forward_one_locus((int)c, cx->Nhaps, (int)cx->Nloci, asum,
+             cx->blk[c-1-base], cx->blk[c-base], cx->anew,
+             newh, existing_h, MutProb_vec, copy_prob, TransProb);
+  cx->cur_base = base;
+}
+
+double InitialiseForward(signed char * newh, signed char ** existing_h, double * col0, double * MutProb_vec, int *p_Nhaps,int *p_Nloci, double * copy_probSTART, double * TransProb) {
 //double InitialiseForward(struct_t *Fb, double * TransProb){
   int i;
   double Alphasum=0;
@@ -59,14 +129,14 @@ double InitialiseForward(signed char * newh, signed char ** existing_h, double *
 	ObsStateProb = (1-MutProb_vec[i]) * (newh[0] == existing_h[i][0]) + MutProb_vec[i] * (newh[0] != existing_h[i][0]);
       }
       
-      Alphamat[0][i] = log(copy_probSTART[i]*ObsStateProb);
-      Alphasum = Alphasum + exp(Alphamat[0][i])*TransProb[0];
+      col0[i] = log(copy_probSTART[i]*ObsStateProb);
+      Alphasum = Alphasum + exp(col0[i])*TransProb[0];
     }
   Alphasum=log(Alphasum);
   return(Alphasum);
 }
 
-double forwardAlgorithm(signed char * newh, signed char ** existing_h, double ** Alphamat, double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob, double * copy_probSTART, double * TransProb, struct param_t *Par) {
+double forwardAlgorithm(signed char * newh, signed char ** existing_h, double ** Alphamat, double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob, double * copy_probSTART, double * TransProb, struct param_t *Par, struct CkptCtx *cx) {
 //double forwardAlgorithm(struct_t *Fb, struct param_t *Par){
   // Perform the forward step
   // return alphasum, the sum of the forward weightings (logged)
@@ -80,57 +150,33 @@ double forwardAlgorithm(signed char * newh, signed char ** existing_h, double **
   double large_num;
 
   if(Par->vverbose) fprintf(Par->out,"        forward Algorithm (initialising) \n");
-  double Alphasum = InitialiseForward(newh, existing_h, Alphamat, MutProb_vec,p_Nhaps,p_Nloci,copy_probSTART,TransProb);
-  /* Per-locus Anew buffer for the fixed-order Alphasumnew sum below. */
-  double * cp_anew = malloc(((size_t)*p_Nhaps) * sizeof(double));
+  int NH = *p_Nhaps, NL = *p_Nloci;
+  double * cp_anew = malloc(((size_t)NH) * sizeof(double));
+  /* ckpt mode keeps only a rolling 2-column buffer; full mode (cx==NULL)
+     writes every column of Alphamat as before. */
+  double * rollA = NULL, * rollB = NULL, * prev, * cur;
+  if (cx) { rollA = malloc((size_t)NH*sizeof(double)); rollB = malloc((size_t)NH*sizeof(double)); prev = rollA; }
+  else { prev = Alphamat[0]; }
+  double Alphasum = InitialiseForward(newh, existing_h, prev, MutProb_vec,p_Nhaps,p_Nloci,copy_probSTART,TransProb);
+  if (cx) { memcpy(cx->cols, prev, (size_t)NH*sizeof(double)); cx->asum[0] = Alphasum; }
 
   if(Par->vverbose) fprintf(Par->out,"        forward Algorithm (computing) \n");
 
   // Perform the forward pass
-  for (locus=1; locus < *p_Nloci; locus++)
+  for (locus=1; locus < NL; locus++)
     {
-      large_num = -1.0*Alphasum;
-      // Note: exp(Alphasum + large_num) = exp(0) = 1.0 exactly under
-      // IEEE 754 (large_num = -Alphasum), so the first term simplifies.
-      /* No reduction(+:Alphasumnew): libgomp combines thread partials in
-         nondeterministic order, so the old result varied run-to-run. Each
-         thread writes its own Anew; Alphasumnew is summed in one pass below.
-         This makes the forward pass reproducible run-to-run and across
-         thread counts FOR A GIVEN BINARY -- exactly what in-memory checkpoint
-         recompute needs (forward and recompute run in one process/binary).
-         Caveat: -funsafe-math-optimizations (in OPTIMIZATION) may vectorize
-         the sum into partial accumulators, so the exact low bits are
-         per-build (vector width / -march / compiler); cross-build raw-double
-         identity is neither guaranteed nor required. Output is unchanged at
-         calibration (printed) precision. */
-#pragma omp parallel for private(ObsStateProb) schedule(static)
-      for (i=0; i < *p_Nhaps; i++)
-	{
-	  if(newh[locus]==9) {
-	    ObsStateProb=1.0;
-	  }else if(newh[locus]==8) {
-	    ObsStateProb = (1-SMALL_NUM) * (newh[locus] == existing_h[i][locus]) + SMALL_NUM * (newh[locus] != existing_h[i][locus]);
-	  }else{
-	    ObsStateProb = (1-MutProb_vec[i]) * (newh[locus] == existing_h[i][locus]) + MutProb_vec[i] * (newh[locus] != existing_h[i][locus]);
-	  }
-
-	  // Pre-log value; Alphamat = log(Anew) - large_num, so
-	  // exp(Alphamat+large_num) == Anew (skip the log/exp roundtrip).
-	  double Anew = ObsStateProb*copy_prob[i] + ObsStateProb*(1-TransProb[(locus-1)])*exp(Alphamat[(locus-1)][i]+large_num);
-	  Alphamat[locus][i] = log(Anew) - large_num;
-	  cp_anew[i] = Anew;
-	}
-      /* tp folds the two old (locus<last ? *TransProb : *1.0) cases into one
-         loop; *1.0 is exact under IEEE-754 so the per-element products and
-         the sum are bit-identical to the two-loop form. */
-      double tp = (locus < (*p_Nloci - 1)) ? TransProb[locus] : 1.0;
-      Alphasumnew = 0.0;
-      for (i=0; i < *p_Nhaps; i++) Alphasumnew += cp_anew[i]*tp;
-      Alphasum = log(Alphasumnew)-large_num;
+      if (cx) { cur = (prev==rollA) ? rollB : rollA; }
+      else { prev = Alphamat[locus-1]; cur = Alphamat[locus]; }
+      Alphasum = forward_one_locus(locus, NH, NL, Alphasum, prev, cur, cp_anew,
+                   newh, existing_h, MutProb_vec, copy_prob, TransProb);
+      if (cx) {
+        if (locus % cx->K == 0) { long m = locus / cx->K; memcpy(cx->cols + m*(long)NH, cur, (size_t)NH*sizeof(double)); cx->asum[m] = Alphasum; }
+        prev = cur;
+      }
     }
-  /* cp_anew is dead past the forward loop; free it here so the NaN error
-     path below (stop_on_error -> longjmp) can't leak it. */
-  free(cp_anew);
+  (void)large_num; (void)Alphasumnew; (void)ObsStateProb; (void)i;
+  if (cx) { free(rollA); free(rollB); }
+  free(cp_anew);  /* dead here; free before the NaN stop_on_error->longjmp below */
 
   // Check that all is well
 
@@ -158,7 +204,7 @@ double forwardAlgorithm(signed char * newh, signed char ** existing_h, double **
 ///////////////////////////////////////////////
 // Backwards algorithm
 
-void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,double p_rhobar, double * N_e_new,signed char * newh, signed char ** existing_h, double ** Alphamat, double * lambda, double delta,double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob,double * copy_prob_new,double * copy_prob_newSTART, double *corrected_chunk_count, double *expected_chunk_length, double * expected_differences,double *regional_chunk_count_sum_final,double *regional_chunk_count_sum_squared_final, int *num_regions, double * copy_probSTART, double * TransProb,int * pop_vec,double *pos, double * snp_info_measure, struct files_t *Outfiles, struct param_t *Par){
+void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,double p_rhobar, double * N_e_new,signed char * newh, signed char ** existing_h, double ** Alphamat, double * lambda, double delta,double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob,double * copy_prob_new,double * copy_prob_newSTART, double *corrected_chunk_count, double *expected_chunk_length, double * expected_differences,double *regional_chunk_count_sum_final,double *regional_chunk_count_sum_squared_final, int *num_regions, double * copy_probSTART, double * TransProb,int * pop_vec,double *pos, double * snp_info_measure, struct files_t *Outfiles, struct param_t *Par, struct CkptCtx *cx){
 
   double total_regional_chunk_count,total_gen_dist;
   double Betasum, Betasumnew;
@@ -209,6 +255,10 @@ void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,
 	exp_copy_pop[i]=0.0;
     }
 
+  const double * aLast;
+  if (cx) { ckpt_load_block(cx, (*p_Nloci-1)/cx->K, newh, existing_h, MutProb_vec, copy_prob, TransProb); aLast = cx->blk[(*p_Nloci-1) - cx->cur_base]; }
+  else aLast = Alphamat[*p_Nloci-1];
+
   for(i=0; i < *p_Nhaps; i++)
     {
       
@@ -222,10 +272,10 @@ void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,
 
       BetavecPREV[i] = 0.0;
       Betasum = Betasum + TransProb[(*p_Nloci-2)]*copy_prob[i]*ObsStateProb*exp(BetavecPREV[i]);
-      if (finalrun) exp_copy_pop[pop_vec[i]]=exp_copy_pop[pop_vec[i]]+exp(BetavecPREV[i]+Alphamat[(*p_Nloci-1)][i]-Alphasum);
+      if (finalrun) exp_copy_pop[pop_vec[i]]=exp_copy_pop[pop_vec[i]]+exp(BetavecPREV[i]+aLast[i]-Alphasum);
 
       // for estimating new mutation rates:
-      expected_differences[i]=expected_differences[i]+exp(Alphamat[(*p_Nloci-1)][i]-Alphasum)*(newh[(*p_Nloci-1)] != existing_h[i][(*p_Nloci-1)]);
+      expected_differences[i]=expected_differences[i]+exp(aLast[i]-Alphasum)*(newh[(*p_Nloci-1)] != existing_h[i][(*p_Nloci-1)]);
     }
   if (finalrun)  printCopyProbs(exp_copy_pop,ind_val,pos[*p_Nloci-1],Outfiles,Par);
 
@@ -236,6 +286,9 @@ void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,
   /* CALCULATE EXPECTED NUMBER OF TIMES OF COPYING TO EACH DONOR POP (Rabiner 1989, p.263,265 or Scheet/Stephens 2006 Appendix C): */
   for (locus = (*p_Nloci-2); locus >= 0; locus--)
     {
+      const double *aL, *aLp1;
+      if (cx) { long m = locus / cx->K; long base = m*cx->K; if (base != cx->cur_base) ckpt_load_block(cx, m, newh, existing_h, MutProb_vec, copy_prob, TransProb); aL = cx->blk[locus - base]; aLp1 = cx->blk[locus+1 - base]; }
+      else { aL = Alphamat[locus]; aLp1 = Alphamat[locus+1]; }
       Betasumnew = 0.0;
       large_num = -1.0*Betasum;
       total_prob=0.0;
@@ -272,11 +325,11 @@ void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,
 	  BetavecCURRENT[i] = log(exp(Betasum+large_num) + (1-TransProb[locus]) * ObsStateProbPREV*exp(BetavecPREV[i] + large_num)) - large_num;
 	  // Cache the 3 unique exp(...) values that get re-used ~10 times
 	  // across the assignments below. ~7-20× exp() calls saved per (locus,i).
-	  double e_a_lp1_bp = exp(Alphamat[(locus+1)][i]+BetavecPREV[i]-Alphasum);
-	  double e_a_l_bp   = exp(Alphamat[locus][i]+BetavecPREV[i]-Alphasum);
-	  double e_a_l_bc   = exp(Alphamat[locus][i]+BetavecCURRENT[i]-Alphasum);
+	  double e_a_lp1_bp = exp(aLp1[i]+BetavecPREV[i]-Alphasum);
+	  double e_a_l_bp   = exp(aL[i]+BetavecPREV[i]-Alphasum);
+	  double e_a_l_bc   = exp(aL[i]+BetavecCURRENT[i]-Alphasum);
 	  if (locus > 0) Betasumnew = Betasumnew + TransProb[(locus-1)]*copy_prob[i]*ObsStateProb*exp(BetavecCURRENT[i] + large_num);
-	  if (locus == 0) copy_prob_newSTART[i] = exp(Alphamat[0][i] + BetavecCURRENT[i] - Alphasum);
+	  if (locus == 0) copy_prob_newSTART[i] = exp(aL[i] + BetavecCURRENT[i] - Alphasum);
 	  total_prob = total_prob + e_a_lp1_bp-e_a_l_bp*ObsStateProbPREV*(1-TransProb[locus]);
 
 	  copy_prob_new[i] = copy_prob_new[i] + e_a_lp1_bp-e_a_l_bp*ObsStateProbPREV*(1-TransProb[locus]);
@@ -298,7 +351,7 @@ void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,
 	  expected_differences[i]=expected_differences[i]+e_a_l_bc*(newh[locus] != existing_h[i][locus]);
 	  BetavecPREV[i] = BetavecCURRENT[i];
 
-	  if (finalrun) exp_copy_pop[pop_vec[i]]=exp_copy_pop[pop_vec[i]]+exp(BetavecCURRENT[i]+Alphamat[locus][i]-Alphasum);
+	  if (finalrun) exp_copy_pop[pop_vec[i]]=exp_copy_pop[pop_vec[i]]+exp(BetavecCURRENT[i]+aL[i]-Alphasum);
 
 	  sum_prob=sum_prob+total_prob_from_i_to_i+total_prob_to_i_exclude_i+total_prob_from_i_exclude_i;
 
@@ -401,8 +454,38 @@ double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char *
   // line bytes → vectorizable, prefetcher-friendly. One huge contiguous
   // storage block (~40 GB for chr1) avoids the jagged-2D TLB pressure
   // of the upstream code.
-  double * Alphamat_storage = malloc(((size_t)*p_Nloci) * ((size_t)*p_Nhaps) * sizeof(double));
-  double ** Alphamat = malloc(*p_Nloci * sizeof(double *));
+  /* Calibration (-s 0) uses Alphamat checkpointing: store only every-K
+     forward column and recompute K-blocks in the backward sweep, cutting
+     ~24 GB/chrom to ~sqrt(Nloci)*Nhaps. -s>0 sampling needs random column
+     access, so it keeps the full matrix (cxp==NULL). */
+  /* Checkpointing density auto-tunes to a per-process Alphamat memory budget
+     (env FS_CP_MAXMEM_GB): K = smallest stride whose checkpoint storage fits
+     the budget => least recompute that fits. No budget (or budget >= full
+     Alphamat) => K=1 => full matrix, no recompute. samplesTOT==0 only. */
+  size_t cp_full = (size_t)*p_Nloci * (size_t)*p_Nhaps * sizeof(double);
+  size_t cp_budget = 0; { const char *e = getenv("FS_CP_MAXMEM_GB"); if (e) cp_budget = (size_t)(atof(e) * 1073741824.0); }
+  int use_ckpt = (Par->samplesTOT == 0) && cp_budget > 0 && cp_full > cp_budget;
+  long cp_K = 1;
+  if (use_ckpt) { cp_K = (long)((cp_full + cp_budget - 1) / cp_budget); if (cp_K < 2) cp_K = 2; if (cp_K > *p_Nloci) cp_K = *p_Nloci; }
+  struct CkptCtx cx; struct CkptCtx *cxp = NULL;
+  double * Alphamat_storage = NULL;
+  double ** Alphamat = NULL;
+  if (use_ckpt) {
+    long K = cp_K;
+    if(Par->vverbose) fprintf(Par->out,"        sampler: Alphamat checkpointing K=%ld (~%.1f GB ckpt, budget %.1f GB)\n", K, (double)(((*p_Nloci-1)/K+1))*(double)(*p_Nhaps)*8.0/1073741824.0, cp_budget/1073741824.0);
+    long ncp = (*p_Nloci - 1) / K + 1;
+    cx.K=K; cx.Nloci=*p_Nloci; cx.Nhaps=*p_Nhaps; cx.cur_base=-1;
+    cx.cols = malloc((size_t)ncp * (size_t)*p_Nhaps * sizeof(double));
+    cx.asum = malloc((size_t)ncp * sizeof(double));
+    cx.blk_store = malloc((size_t)(K+1) * (size_t)*p_Nhaps * sizeof(double));
+    cx.blk = malloc((size_t)(K+1) * sizeof(double *));
+    { long j; for (j=0;j<=K;j++) cx.blk[j] = cx.blk_store + j*(size_t)*p_Nhaps; }
+    cx.anew = malloc((size_t)*p_Nhaps * sizeof(double));
+    cxp = &cx;
+  } else {
+    Alphamat_storage = malloc(((size_t)*p_Nloci) * ((size_t)*p_Nhaps) * sizeof(double));
+    Alphamat = malloc(*p_Nloci * sizeof(double *));
+  }
   double * copy_prob_new = malloc(*p_Nhaps * sizeof(double));
   double * copy_prob_newSTART = malloc(*p_Nhaps * sizeof(double));
   double * Alphasumvec = malloc(*p_Nloci * sizeof(double));
@@ -418,7 +501,7 @@ double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char *
   // Each Alphamat[locus] points to the locus-th column of n_haps
   // doubles within Alphamat_storage. We reuse `i` as a generic
   // counter for `locus` here to avoid declaring a new variable.
-  for(i=0 ; i< *p_Nloci ; i++)
+  if (!use_ckpt) for(i=0 ; i< *p_Nloci ; i++)
     {
       Alphamat[i] = Alphamat_storage + ((size_t)i) * ((size_t)*p_Nhaps);
     }
@@ -441,14 +524,14 @@ double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char *
 
   if(Par->vverbose) fprintf(Par->out,"        sampler: forwards algorithm\n");
       /* FORWARDS ALGORITHM: (Rabiner 1989, p.262) */
-  double Alphasum = forwardAlgorithm(newh, existing_h, Alphamat, MutProb_vec, p_Nhaps,p_Nloci,copy_prob, copy_probSTART, TransProb,Par);
+  double Alphasum = forwardAlgorithm(newh, existing_h, Alphamat, MutProb_vec, p_Nhaps,p_Nloci,copy_prob, copy_probSTART, TransProb,Par,cxp);
 
   if(Outfiles->usingFile[2]) fprintf(Outfiles->fout3," %.10lf",Alphasum);
 
   if(Par->vverbose) fprintf(Par->out,"        sampler: backwards algorithm\n");
   int finalrun= (run_num == (Par->EMruns-1));
   if(run_num <= (Par->EMruns-1)){
-    backwardAlgorithm(finalrun,ndonorpops,ind_val,Alphasum,p_rhobar,&N_e_new,newh,existing_h,Alphamat,lambda,delta,MutProb_vec,p_Nhaps,p_Nloci,copy_prob,copy_prob_new,copy_prob_newSTART, corrected_chunk_count, expected_chunk_length, expected_differences,regional_chunk_count_sum_final,regional_chunk_count_sum_squared_final, &num_regions, copy_probSTART, TransProb, pop_vec,pos,snp_info_measure,Outfiles,Par);
+    backwardAlgorithm(finalrun,ndonorpops,ind_val,Alphasum,p_rhobar,&N_e_new,newh,existing_h,Alphamat,lambda,delta,MutProb_vec,p_Nhaps,p_Nloci,copy_prob,copy_prob_new,copy_prob_newSTART, corrected_chunk_count, expected_chunk_length, expected_differences,regional_chunk_count_sum_final,regional_chunk_count_sum_squared_final, &num_regions, copy_probSTART, TransProb, pop_vec,pos,snp_info_measure,Outfiles,Par,cxp);
   }
 
   //////////////////////////////// 
@@ -466,7 +549,7 @@ double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char *
 	 }
 
            /* calculate Alphasums (for efficient sampling): */
-       for (locus=0; locus < *p_Nloci; locus++)
+       if (Par->samplesTOT > 0) for (locus=0; locus < *p_Nloci; locus++)
 	 {
 	   Alphasumvec[locus] = 0.0;
 	   large_num = Alphamat[locus][0];
@@ -579,8 +662,8 @@ double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char *
    if(Par->vverbose) fprintf(Par->out,"        sampler: freeing memory.\n");
    // One free for the contiguous storage, one for the row-pointer
    // array. No per-row frees (no per-row mallocs).
-   free(Alphamat_storage);
-   free(Alphamat);
+   if (use_ckpt) { free(cx.cols); free(cx.asum); free(cx.blk_store); free(cx.blk); free(cx.anew); }
+   else { free(Alphamat_storage); free(Alphamat); }
    free(TransProb);
    free(sample_state);
    free(Alphasumvec);
