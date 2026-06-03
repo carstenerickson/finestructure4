@@ -83,17 +83,39 @@ vectorized math.
 
 ---
 
-## 4. Feasibility — proven numerically
+## 4. Feasibility — validated numerically (NumPy)
 
-- **Isolated mechanism demo** (`/tmp/offset_demo.py`): rescale-float32 error is `~1e-7` at
-  `|offset|` from 0 to 2e6, while log-float32 grows to 6%. Rescale is robust to the exact thing
-  that kills the drop-in.
-- **Faithful recursion prototype** (forward + scaled backward, synthetic 1004 donors): rescale
-  in **double** reproduces the double/log-space reference to 0.0000% (algorithm is correct),
-  and rescale in **float32** stays exact.
-- Remaining gate: the **full-pipeline chunklength Δ** on real chr11 (forward + the real backward
-  chunk formulas), expected ~1e-6 (float relative) — well inside the calibration band, but must
-  be measured, like every other numeric change here.
+A full forward–backward NumPy prototype transcribing the **actual ChromoPainter chunk-count and
+expected-chunk-length formulas** (`docs/prototypes/float_rescale_fb.py`) was run in four precision
+variants vs a double/log-space reference:
+
+| variant | chunk-length max %Δ | chunk-count max %Δ |
+|--|--|--|
+| double log-space (reference) | 0 | 0 |
+| **rescale `ahat`, double** | **0.0000%** | **0.0000%** | ← algebra + chunk formulas correct |
+| **rescale `ahat`, float32** | **0.0000%** | **0.0000%** | ← float storage is safe |
+| drop-in `Alphamat` float32 | grows with offset (below) | — |
+
+**Offset stress** — the chunk probabilities are invariant to adding a constant `K` to
+`Alphamat` and `Alphasum` together (exact arithmetic), so sweeping `K` simulates the real
+`|Σ|`≈1e6 condition while *only* stressing the float storage:
+
+| `K` (cumulative normalizer) | drop-in float32 | rescale float32 |
+|--:|--:|--:|
+| 0 | 0.0002% | **0.000000%** |
+| 1e5 | 0.008% | **0.000000%** |
+| 1e6 | 0.099% | **0.000000%** |
+| 2e6 | 0.53% | **0.000000%** |
+
+- The drop-in degrades with offset (the real-data regime); **rescale-float32 is flat-zero at
+  every offset, through the full chunk formulas** — including the scale-cancellation in the
+  expected-chunk-length terms, which was the main risk.
+- The isolated mechanism demo (`offset_demo.py`) independently shows the per-element forward
+  read error: log-float32 → 6.4% at `|offset|`=2e6, rescale-float32 → 1e-7.
+
+This **de-risks the delicate part in software.** Remaining gate is only the real-data
+confirmation: build the C version and diff `.cp.chunklengths.out` / `.cp.chunkcounts.out` vs the
+deployed binary across 22 autosomes (expected ~1e-6, well inside the calibration band).
 
 ---
 
