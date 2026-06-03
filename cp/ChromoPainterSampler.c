@@ -66,6 +66,16 @@ double InitialiseForward(signed char * newh, signed char ** existing_h, double *
   return(Alphasum);
 }
 
+/* This TU is built with -ffast-math (Makefile.am: libcppaint_a_CFLAGS),
+   which implies -ffinite-math-only and elides isnan(). Detect NaN by its
+   bit pattern (exponent all-ones, nonzero mantissa) so the likelihood
+   guard survives the flag. */
+static inline int cp_is_nan(double x){
+  union { double d; unsigned long long u; } v; v.d = x;
+  return ((v.u & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL)
+         && (v.u & 0x000FFFFFFFFFFFFFULL);
+}
+
 double forwardAlgorithm(signed char * newh, signed char ** existing_h, double ** Alphamat, double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob, double * copy_probSTART, double * TransProb, struct param_t *Par) {
 //double forwardAlgorithm(struct_t *Fb, struct param_t *Par){
   // Perform the forward step
@@ -134,7 +144,7 @@ double forwardAlgorithm(signed char * newh, signed char ** existing_h, double **
 
   // Check that all is well
 
-  if (isnan(Alphasum))
+  if (cp_is_nan(Alphasum))
     {
       fprintf(Par->out,"Sampler::forwardAlgorithm error: Negative or NaN likelihood. Could be because emission or transition probabilities are too low??...Exiting...\n");
       /* fprintf(Par->out,"Alpha matrix for debugging\n"); */
