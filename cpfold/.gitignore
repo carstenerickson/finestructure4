@@ -1,0 +1,6 @@
+win/
+win*.phase
+win*.recom
+out/
+__pycache__/
+*.cp.*
