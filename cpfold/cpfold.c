@@ -144,6 +144,47 @@ static Groups build_groups(int B){
 }
 static void free_groups(Groups *G){ free(G->blk);free(G->gidB);free(G->sizeg);free(G->repg);free(G->popg); }
 
+/* ADAPTIVE block boundaries (PBWT-style): grow each block by incrementally
+   splitting the substring grouping column-by-column; cut when U reaches Ustar.
+   Blocks are long where local diversity is low (-> fewer boundaries, less boundary
+   tax) and short where it is high. The incremental split IS the grouping, so this
+   produces blocks + gid in one O(N*K) pass. Variable block lengths; the fold
+   engine already reads blk[].s/e so it needs no change. */
+static Groups build_groups_adaptive(int Ustar){
+    Groups G; G.B=Ustar; G.nb=0;
+    int cap_blk=64; G.blk=malloc(sizeof(Block)*cap_blk); int *gidB=NULL;
+    int *gid=malloc(sizeof(int)*K), *ng=malloc(sizeof(int)*K);
+    int mapsz=(Ustar+8)*4; if(mapsz<16) mapsz=16;
+    int *mp=malloc(sizeof(int)*mapsz), *mstamp=calloc(mapsz,sizeof(int)); int gen=0, Umax=0;
+    int a=0; for(int i=0;i<K;i++) gid[i]=0; int U=1; int b=0;
+    while(b<N){
+        gen++; int newU=0; const uint8_t *col=donors+(size_t)b*K;
+        for(int i=0;i<K;i++){ int al=col[i], code=al<2?al:(al==8?2:3); int ek=gid[i]*4+code;
+            if(mstamp[ek]!=gen){ mstamp[ek]=gen; mp[ek]=newU++; } ng[i]=mp[ek]; }
+        if(newU>Ustar && (b-a)>=2 && b<N-1){           /* cut: block [a,b) keeps grouping `gid`; reprocess b */
+            if(G.nb>=cap_blk){ cap_blk*=2; G.blk=realloc(G.blk,sizeof(Block)*cap_blk); }
+            G.blk[G.nb].s=a; G.blk[G.nb].e=b; G.blk[G.nb].U=U;
+            gidB=realloc(gidB,(size_t)(G.nb+1)*K*sizeof(int)); memcpy(gidB+(size_t)G.nb*K,gid,K*sizeof(int));
+            if(U>Umax)Umax=U; G.nb++;
+            a=b; for(int i=0;i<K;i++) gid[i]=0; U=1;     /* new block; do NOT advance b */
+        } else { int *t=gid;gid=ng;ng=t; U=newU; b++; } /* accept column b */
+    }
+    if(G.nb>=cap_blk){ cap_blk*=2; G.blk=realloc(G.blk,sizeof(Block)*cap_blk); }
+    G.blk[G.nb].s=a; G.blk[G.nb].e=N; G.blk[G.nb].U=U;
+    gidB=realloc(gidB,(size_t)(G.nb+1)*K*sizeof(int)); memcpy(gidB+(size_t)G.nb*K,gid,K*sizeof(int));
+    if(U>Umax)Umax=U; G.nb++;
+    free(gid);free(ng);free(mp);free(mstamp);
+    G.gidB=gidB; G.Umax=Umax;
+    G.sizeg=malloc(sizeof(int)*(size_t)G.nb*Umax); G.repg=malloc(sizeof(int)*(size_t)G.nb*Umax);
+    G.popg=malloc(sizeof(int)*(size_t)G.nb*Umax);   /* unused under substring-only, kept for free_groups */
+    for(int bb=0;bb<G.nb;bb++){ int Ub=G.blk[bb].U; int *gb=gidB+(size_t)bb*K;
+        int *sz=G.sizeg+(size_t)bb*Umax,*rp=G.repg+(size_t)bb*Umax;
+        for(int g=0;g<Ub;g++){sz[g]=0;rp[g]=-1;}
+        for(int i=0;i<K;i++){int g=gb[i];sz[g]++; if(rp[g]<0)rp[g]=i;}
+    }
+    return G;
+}
+
 /* lazy emission: the fold needs e only at group reps (O(N*U)) + per-donor at the
    O(K)-per-block boundaries - NOT the full O(N*K) matrix the dense engine fills. */
 static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups *Gr){
@@ -260,7 +301,7 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
 }
 
 int main(int argc, char**argv){
-    if(argc<3){ fprintf(stderr,"usage: %s cdata.bin blocksize\n",argv[0]); return 1; }
+    if(argc<3){ fprintf(stderr,"usage: %s cdata.bin blocksize|Ustar [reps] [ad]\n",argv[0]); return 1; }
     int B = atoi(argv[2]);
     FILE *f=fopen(argv[1],"rb"); if(!f){perror("open");return 1;}
     int hdr[4]; fread(hdr,sizeof(int),4,f); K=hdr[0];N=hdr[1];npop=hdr[2];nrecip=hdr[3];
@@ -283,11 +324,12 @@ int main(int argc, char**argv){
     double *As=malloc(sizeof(double)*N), *Bs=malloc(sizeof(double)*N), *cc=malloc(sizeof(double)*K);
     double dense_pp[16]={0}, fold_pp_tot[16]={0};
     int reps = (argc>3)? atoi(argv[3]) : 7;       /* repeat timing, take MIN (denoise) */
+    int adaptive = (argc>4 && strcmp(argv[4],"ad")==0); /* arg5=="ad" -> PBWT adaptive blocks, B used as Ustar */
 
-    Groups G=build_groups(B);   /* (timed below; here for the correctness pass) */
-    { long sumU=0, slots=0; for(int b=0;b<G.nb;b++){ sumU+=G.blk[b].U; slots+=(long)(G.blk[b].e-G.blk[b].s)*G.blk[b].U; }
-      printf("  grouping: %d blocks, Umean=%.1f (vs K=%d -> fold ratio %.1fx), interior slots N*Umean=%ld vs N*K=%ld\n",
-             G.nb, (double)sumU/G.nb, K, (double)K/((double)sumU/G.nb), slots, (long)N*K); }
+    Groups G = adaptive ? build_groups_adaptive(B) : build_groups(B);  /* (timed below; here for the correctness pass) */
+    { long sumU=0, slots=0; int Ufold=0; for(int b=0;b<G.nb;b++){ sumU+=G.blk[b].U; slots+=(long)(G.blk[b].e-G.blk[b].s)*G.blk[b].U; if(G.blk[b].U>Ufold)Ufold=G.blk[b].U; }
+      printf("  grouping[%s]: %d blocks, Umean=%.1f Umax=%d (vs K=%d -> fold ratio %.1fx), mean block len=%.1f, interior slots N*Umean=%ld vs N*K=%ld\n",
+             adaptive?"adaptive":"fixed", G.nb, (double)sumU/G.nb, Ufold, K, (double)K/((double)sumU/G.nb), (double)N/G.nb, slots, (long)N*K); }
 
     /* correctness pass (once) */
     for(int r=0;r<nrecip;r++){ fill_E(E,r); for(int i=0;i<K;i++)cc[i]=0.0;
@@ -301,7 +343,7 @@ int main(int argc, char**argv){
         double t0=now_s();
         for(int r=0;r<nrecip;r++){ fill_E(E,r); dense_cc(E,cc,a,c,As,Bs); }
         double d=now_s()-t0; if(d<td)td=d;
-        double tg0=now_s(); Groups Gt=build_groups(B); double g=now_s()-tg0; if(g<tg)tg=g; free_groups(&Gt);
+        double tg0=now_s(); Groups Gt = adaptive ? build_groups_adaptive(B) : build_groups(B); double g=now_s()-tg0; if(g<tg)tg=g; free_groups(&Gt);
         double t1=now_s();
         for(int r=0;r<nrecip;r++){ for(int p=0;p<npop;p++)fp[p]=0.0; fold_cc(r,fp,&G); }
         double ff=now_s()-t1; if(ff<tf)tf=ff;
