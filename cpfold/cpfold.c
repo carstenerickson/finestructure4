@@ -105,8 +105,9 @@ static Groups build_groups(int B){
     G.gidB=malloc(sizeof(int)*(size_t)nb*K);
     /* O(N*K) grouping by hash on packed (alleles 2bit + pop) keys - no sort, no
        O(B) comparator, no log K. Open-addressing table reused per block via a gen
-       stamp. Key = ceil(2B/64) allele words + 1 pop word. */
-    int W = (2*B + 63)/64 + 1;
+       stamp. Key = ceil(2B/64) allele words (SUBSTRING-ONLY: pop is split at the
+       chunkcount scatter, so the forward/backward state folds over fewer groups). */
+    int W = (2*B + 63)/64; if(W<1) W=1;
     int cap=1; while(cap < 4*K) cap<<=1;
     uint64_t *htkey=malloc((size_t)cap*W*sizeof(uint64_t));
     int *htgid=malloc(sizeof(int)*cap), *htstamp=calloc(cap,sizeof(int));
@@ -119,7 +120,6 @@ static Groups build_groups(int B){
         for(int i=0;i<K;i++){
             for(int w=0;w<W;w++) key[w]=0;
             for(int l=sb;l<eb;l++){ int bp=2*(l-sb); key[bp>>6]|=(uint64_t)(donors[(size_t)l*K+i]&3)<<(bp&63); }
-            key[W-1]=(uint64_t)pop_vec[i];
             uint64_t h=1469598103934665603ULL; for(int w=0;w<W;w++) h=(h^key[w])*1099511628211ULL;
             int slot=h&(cap-1);
             for(;;){
@@ -162,7 +162,10 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
     double *SentS=malloc((size_t)nb*Umax*sizeof(double)), *SwS=malloc((size_t)nb*Umax*sizeof(double));
     double *G=malloc(Umax*sizeof(double)), *P=malloc(Umax*sizeof(double));
     double *GBp=malloc(Umax*sizeof(double)), *PBp=malloc(Umax*sizeof(double));
-    double *GBc=malloc(Umax*sizeof(double)), *PBc=malloc(Umax*sizeof(double)), *Saw=malloc(Umax*sizeof(double));
+    double *GBc=malloc(Umax*sizeof(double)), *PBc=malloc(Umax*sizeof(double));
+    /* per-(substring-group, pop) moments for the chunkcount scatter [Umax*npop] */
+    double *szP=malloc((size_t)Umax*npop*sizeof(double)), *SaP=malloc((size_t)Umax*npop*sizeof(double));
+    double *SwP=malloc((size_t)Umax*npop*sizeof(double)), *SawP=malloc((size_t)Umax*npop*sizeof(double));
 
     /* TARGET 3: precompute per-group emissions ONCE (the only gather); fwd/bwd/chunk read contiguous. */
     for(int b=0;b<nb;b++){ int sb=blk[b].s,eb=blk[b].e,U=blk[b].U; int *rp=repg+(size_t)b*Umax;
@@ -202,12 +205,14 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
     { double sb0=0.0; for(int i=0;i<K;i++) sb0+=T[N-2]*copyprob*EM(N-1,i); Bs[N-1]=log(sb0); }
     for(int b=nb-1;b>=0;b--){
         int sb=blk[b].s, eb=blk[b].e, U=blk[b].U; int *gb=gidB+(size_t)b*K;
-        int *sz=sizeg+(size_t)b*Umax, *pg=popg+(size_t)b*Umax;
+        int *sz=sizeg+(size_t)b*Umax;
         int top=(eb-1<N-2)?eb-1:N-2;
-        double *w=WB+(size_t)b*K, *Sw=SwS+(size_t)b*Umax, *ent=AENTRY+(size_t)b*K, *Saent=SentS+(size_t)b*Umax;
+        double *w=WB+(size_t)b*K, *Sw=SwS+(size_t)b*Umax, *ent=AENTRY+(size_t)b*K;
         double *GFb=GF+off[b], *PFb=PF+off[b], *Egb=Eg+off[b];
-        for(int g=0;g<U;g++){ Sw[g]=0.0; Saw[g]=0.0; }
-        for(int i=0;i<K;i++){ double wi=EM(top+1,i)*cexit[i]; w[i]=wi; int g=gb[i]; Sw[g]+=wi; Saw[g]+=ent[i]*wi; }
+        for(int g=0;g<U;g++) Sw[g]=0.0;                       /* substring total (for Bs) */
+        for(int gp=0;gp<U*npop;gp++){ szP[gp]=0.0; SaP[gp]=0.0; SwP[gp]=0.0; SawP[gp]=0.0; }
+        for(int i=0;i<K;i++){ double wi=EM(top+1,i)*cexit[i]; w[i]=wi; int g=gb[i], p=pop_vec[i]; double ei=ent[i];
+            Sw[g]+=wi; int idx=g*npop+p; szP[idx]+=1.0; SaP[idx]+=ei; SwP[idx]+=wi; SawP[idx]+=ei*wi; }
         for(int l=top;l>=sb;l--){
             double rb=(l+2<=N-1)?exp(Bs[l+2]-Bs[l+1]):exp(-Bs[N-1]);
             double *Er1=(l+1<eb)?Egb+(size_t)(l+1-sb)*U:0;
@@ -224,7 +229,10 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
                     double eg=Er1[g];
                     double XG=GFr1[g]*KF1 - GFr[g]*KF*eg*om, XP=PFr1[g]*KF1 - PFr[g]*KF*eg*om;
                     double GBl1,PBl1; if(l+1==N-1){GBl1=1.0;PBl1=0.0;} else {GBl1=GBp[g];PBl1=PBp[g];}
-                    ccpop[pg[g]] += GBl1*XG*sz[g] + GBl1*XP*Saent[g] + PBl1*XG*Sw[g] + PBl1*XP*Saw[g];
+                    /* per-group coeffs computed ONCE (U_sub of them); scatter to present pops */
+                    double cA=GBl1*XG, cB=GBl1*XP, cC=PBl1*XG, cD=PBl1*XP; int base=g*npop;
+                    for(int p=0;p<npop;p++){ double s_=szP[base+p]; if(s_==0.0) continue;
+                        ccpop[p] += cA*s_ + cB*SaP[base+p] + cC*SwP[base+p] + cD*SawP[base+p]; }
                 }
             } else if(b+1<nb){   /* boundary locus l=eb-1: per-donor O(K), c_{l+1}=CEXIT[b+1] */
                 int *gb2=gidB+(size_t)(b+1)*K; double *ent2=AENTRY+(size_t)(b+1)*K, *cx2=CEXIT+(size_t)(b+1)*K;
@@ -246,7 +254,8 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
       for(int i=0;i<K;i++){ int g=gb0[i]; double a0=GF0[g]+PF0[g]*ent0[i]; ccpop[pop_vec[i]] += a0*cx0[i]*k0; } }
 
     free(off);free(GF);free(PF);free(Eg);free(AENTRY);free(WB);free(CEXIT);free(As);free(Bs);
-    free(SentS);free(SwS);free(G);free(P);free(GBp);free(PBp);free(GBc);free(PBc);free(Saw);free(aprev);free(cexit);
+    free(SentS);free(SwS);free(G);free(P);free(GBp);free(PBp);free(GBc);free(PBc);
+    free(szP);free(SaP);free(SwP);free(SawP);free(aprev);free(cexit);
     return 0;
 }
 
