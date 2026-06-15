@@ -151,114 +151,102 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
     #define EM(L,II) emis(rh[(L)], donors[(size_t)(L)*K+(II)])
     int nb=Gr->nb, Umax=Gr->Umax; Block *blk=Gr->blk; int *gidB=Gr->gidB;
     int *sizeg=Gr->sizeg, *repg=Gr->repg, *popg=Gr->popg;
-    /* malloc not calloc: only [0,U_block) of each locus row is written+read, so
-       zeroing all N*Umax pages (which grows with block size) is pure waste. */
-    double *GF=malloc((size_t)N*Umax*sizeof(double)), *PF=malloc((size_t)N*Umax*sizeof(double));
-    double *GB=malloc((size_t)N*Umax*sizeof(double)), *PB=malloc((size_t)N*Umax*sizeof(double));
+    /* TARGET 2: tight per-block layout (offset = sum len*U; no Umax waste). Only
+       GF/PF + the per-group emission table Eg are stored; GB/PB are transient. */
+    size_t *off=malloc(sizeof(size_t)*nb), tot=0;
+    for(int b=0;b<nb;b++){ off[b]=tot; tot += (size_t)(blk[b].e-blk[b].s)*blk[b].U; }
+    double *GF=malloc(tot*sizeof(double)), *PF=malloc(tot*sizeof(double)), *Eg=malloc(tot*sizeof(double));
     double *AENTRY=malloc(sizeof(double)*(size_t)nb*K), *WB=malloc(sizeof(double)*(size_t)nb*K);
+    double *CEXIT=malloc(sizeof(double)*(size_t)nb*K);  /* materialized c at each block left edge */
     double *As=malloc(sizeof(double)*N), *Bs=malloc(sizeof(double)*N);
-    double *G=malloc(sizeof(double)*Umax), *P=malloc(sizeof(double)*Umax);
-    /* per-block group moments stored from the fwd/bwd passes (Saent==fwd Sentry,
-       Sw==bwd Sw): reused in chunkcount so it only needs Saw - no recompute. */
     double *SentS=malloc((size_t)nb*Umax*sizeof(double)), *SwS=malloc((size_t)nb*Umax*sizeof(double));
+    double *G=malloc(Umax*sizeof(double)), *P=malloc(Umax*sizeof(double));
+    double *GBp=malloc(Umax*sizeof(double)), *PBp=malloc(Umax*sizeof(double));
+    double *GBc=malloc(Umax*sizeof(double)), *PBc=malloc(Umax*sizeof(double)), *Saw=malloc(Umax*sizeof(double));
 
-    /* FORWARD: store GF/PF + Sentry; materialize AENTRY (block entry = a_{sblk-1}) */
+    /* TARGET 3: precompute per-group emissions ONCE (the only gather); fwd/bwd/chunk read contiguous. */
+    for(int b=0;b<nb;b++){ int sb=blk[b].s,eb=blk[b].e,U=blk[b].U; int *rp=repg+(size_t)b*Umax;
+        double *base=Eg+off[b];
+        for(int l=sb;l<eb;l++){ double *row=base+(size_t)(l-sb)*U; for(int g=0;g<U;g++) row[g]=EM(l, rp[g]); } }
+
+    /* FORWARD: GF/PF (tight) + As + Sentry; materialize AENTRY (=a_{sblk-1}) */
     double *aprev=calloc(K,sizeof(double));
     for(int b=0;b<nb;b++){
-        int sb=blk[b].s, eb=blk[b].e, U=blk[b].U; int *gb=gidB+(size_t)b*K;
-        int *sz=sizeg+(size_t)b*Umax, *rp=repg+(size_t)b*Umax;
+        int sb=blk[b].s, eb=blk[b].e, U=blk[b].U; int *gb=gidB+(size_t)b*K; int *sz=sizeg+(size_t)b*Umax;
         double *ent=AENTRY+(size_t)b*K, *Sx=SentS+(size_t)b*Umax;
+        double *GFb=GF+off[b], *PFb=PF+off[b], *Egb=Eg+off[b];
         for(int g=0;g<U;g++) Sx[g]=0.0;
-        for(int i=0;i<K;i++){ double a=(b==0)?0.0:aprev[i]; ent[i]=a; if(b>0) Sx[gb[i]]+=a; } /* fused copy+Sentry */
+        for(int i=0;i<K;i++){ double a=(b==0)?0.0:aprev[i]; ent[i]=a; if(b>0) Sx[gb[i]]+=a; }
         for(int l=sb;l<eb;l++){
-            double rlm1 = (l>=2)? exp(As[l-2]-As[l-1]) : ((l==1)?exp(-As[0]):0.0);
+            double rlm1=(l>=2)?exp(As[l-2]-As[l-1]):((l==1)?exp(-As[0]):0.0);
+            double *GFr=GFb+(size_t)(l-sb)*U, *PFr=PFb+(size_t)(l-sb)*U, *Er=Egb+(size_t)(l-sb)*U;
+            double sumA=0.0;
             for(int g=0;g<U;g++){
-                double eg=EM(l, rp[g]);
-                if(l==sb && b==0){ G[g]=copyprob*eg; P[g]=0.0; }
-                else if(l==sb){ G[g]=eg*copyprob; P[g]=eg*(1-T[l-1])*rlm1; }
-                else { double fac=eg*(1-T[l-1])*rlm1; G[g]=eg*copyprob+fac*G[g]; P[g]=fac*P[g]; }
-                GF[(size_t)l*Umax+g]=G[g]; PF[(size_t)l*Umax+g]=P[g];
+                double eg=Er[g], gv,pv;
+                if(l==sb && b==0){ gv=copyprob*eg; pv=0.0; }
+                else if(l==sb){ gv=eg*copyprob; pv=eg*(1-T[l-1])*rlm1; }
+                else { double fac=eg*(1-T[l-1])*rlm1; gv=eg*copyprob+fac*G[g]; pv=fac*P[g]; }
+                G[g]=gv; P[g]=pv; GFr[g]=gv; PFr[g]=pv; sumA += sz[g]*gv + pv*Sx[g];
             }
-            double sumA=0.0; for(int g=0;g<U;g++) sumA += sz[g]*G[g] + P[g]*Sx[g];
-            double s = (l<N-1)? sumA*T[l] : sumA;
-            As[l] = (l>=1?As[l-1]:0.0) + log(s);
+            double s=(l<N-1)?sumA*T[l]:sumA; As[l]=(l>=1?As[l-1]:0.0)+log(s);
         }
-        for(int i=0;i<K;i++){ int g=gb[i]; aprev[i]= GF[(size_t)(eb-1)*Umax+g] + PF[(size_t)(eb-1)*Umax+g]*ent[i]; }
+        double *GFl=GFb+(size_t)(eb-1-sb)*U, *PFl=PFb+(size_t)(eb-1-sb)*U;
+        for(int i=0;i<K;i++){ int g=gb[i]; aprev[i]=GFl[g]+PFl[g]*ent[i]; }
     }
 
-    /* BACKWARD: store GB/PB, materialize WB (= E[eb]*c_{eb}) per block */
+    /* BACKWARD + CHUNKCOUNT FUSED (TARGET 1): GB/PB transient (cur/prev swap); the chunkcount
+       increment for locus l is accumulated inside the backward sweep; boundary uses CEXIT[b+1]. */
+    double Asf=As[N-1];
+    for(int p=0;p<npop;p++) ccpop[p]=0.0;
     double *cexit=malloc(sizeof(double)*K); for(int i=0;i<K;i++) cexit[i]=1.0;
-    { double sb0=0.0; for(int i=0;i<K;i++) sb0+=T[N-2]*copyprob*EM(N-1, i); Bs[N-1]=log(sb0); }
+    { double sb0=0.0; for(int i=0;i<K;i++) sb0+=T[N-2]*copyprob*EM(N-1,i); Bs[N-1]=log(sb0); }
     for(int b=nb-1;b>=0;b--){
         int sb=blk[b].s, eb=blk[b].e, U=blk[b].U; int *gb=gidB+(size_t)b*K;
-        int *sz=sizeg+(size_t)b*Umax, *rp=repg+(size_t)b*Umax;
-        int top = (eb-1 < N-2)? eb-1 : N-2;
-        double *w=WB+(size_t)b*K, *Sx=SwS+(size_t)b*Umax;
-        for(int g=0;g<U;g++) Sx[g]=0.0;
-        for(int i=0;i<K;i++){ double wi=EM(top+1, i)*cexit[i]; w[i]=wi; Sx[gb[i]]+=wi; } /* fused w+Sw */
+        int *sz=sizeg+(size_t)b*Umax, *pg=popg+(size_t)b*Umax;
+        int top=(eb-1<N-2)?eb-1:N-2;
+        double *w=WB+(size_t)b*K, *Sw=SwS+(size_t)b*Umax, *ent=AENTRY+(size_t)b*K, *Saent=SentS+(size_t)b*Umax;
+        double *GFb=GF+off[b], *PFb=PF+off[b], *Egb=Eg+off[b];
+        for(int g=0;g<U;g++){ Sw[g]=0.0; Saw[g]=0.0; }
+        for(int i=0;i<K;i++){ double wi=EM(top+1,i)*cexit[i]; w[i]=wi; int g=gb[i]; Sw[g]+=wi; Saw[g]+=ent[i]*wi; }
         for(int l=top;l>=sb;l--){
-            double rb = (l+2<=N-1)? exp(Bs[l+2]-Bs[l+1]) : exp(-Bs[N-1]);
-            for(int g=0;g<U;g++){
-                if(l==top){ G[g]=1.0; P[g]=(1-T[l])*rb; }
-                else { double fac=(1-T[l])*EM(l+1, rp[g])*rb; G[g]=1.0+fac*G[g]; P[g]=fac*P[g]; }
-                GB[(size_t)l*Umax+g]=G[g]; PB[(size_t)l*Umax+g]=P[g];
-            }
-            if(l>0){ double sB=0.0; for(int g=0;g<U;g++){ double egl=EM(l, rp[g]); sB += egl*(sz[g]*G[g]+P[g]*Sx[g]); }
-                Bs[l]=Bs[l+1]+log(T[l-1]*copyprob*sB); }
-        }
-        /* materialize c_{sb} -> cexit for next (leftward) block */
-        for(int i=0;i<K;i++){ int g=gb[i]; cexit[i]= GB[(size_t)sb*Umax+g] + PB[(size_t)sb*Umax+g]*w[i]; }
-    }
-
-    /* CHUNKCOUNT: O(N*U) interior bilinear + O(K) boundary + start */
-    double Asf=As[N-1];
-    double *Saw=malloc(sizeof(double)*Umax);   /* alloc once; Saent/Sw reused from fwd/bwd */
-    for(int p=0;p<npop;p++) ccpop[p]=0.0;
-    for(int b=0;b<nb;b++){
-        int sb=blk[b].s, eb=blk[b].e, U=blk[b].U; int *gb=gidB+(size_t)b*K;
-        int *sz=sizeg+(size_t)b*Umax, *rp=repg+(size_t)b*Umax, *pg=popg+(size_t)b*Umax;
-        double *ent=AENTRY+(size_t)b*K, *w=WB+(size_t)b*K;
-        double *Saent=SentS+(size_t)b*Umax, *Sw=SwS+(size_t)b*Umax;   /* reused (no recompute) */
-        for(int g=0;g<U;g++) Saw[g]=0.0;
-        for(int i=0;i<K;i++){ int g=gb[i]; Saw[g]+=ent[i]*w[i]; }      /* only Saw is fresh */
-        for(int l=sb;l<eb;l++){
-            if(l==N-1) continue;
+            double rb=(l+2<=N-1)?exp(Bs[l+2]-Bs[l+1]):exp(-Bs[N-1]);
+            double *Er1=(l+1<eb)?Egb+(size_t)(l+1-sb)*U:0;
+            if(l==top){ for(int g=0;g<U;g++){ GBc[g]=1.0; PBc[g]=(1-T[l])*rb; } }
+            else { for(int g=0;g<U;g++){ double fac=(1-T[l])*Er1[g]*rb; GBc[g]=1.0+fac*GBp[g]; PBc[g]=fac*PBp[g]; } }
+            if(l>0){ double *Er=Egb+(size_t)(l-sb)*U; double sB=0.0;
+                for(int g=0;g<U;g++) sB+=Er[g]*(sz[g]*GBc[g]+PBc[g]*Sw[g]); Bs[l]=Bs[l+1]+log(T[l-1]*copyprob*sB); }
             double BsR=(l+2<=N-1)?Bs[l+2]:0.0, Asm1=(l>=1)?As[l-1]:0.0;
             double KF1=exp(As[l]+BsR-Asf), KF=exp(Asm1+BsR-Asf), om=(1-T[l]);
-            if(l < eb-1){ /* interior, O(U) */
+            double *GFr=GFb+(size_t)(l-sb)*U, *PFr=PFb+(size_t)(l-sb)*U;
+            if(l < eb-1){   /* interior: GB[l+1]=GBp (prev), GF/PF stored, moments */
+                double *GFr1=GFb+(size_t)(l+1-sb)*U, *PFr1=PFb+(size_t)(l+1-sb)*U;
                 for(int g=0;g<U;g++){
-                    double eg=EM(l+1, rp[g]);
-                    double GFl=GF[(size_t)l*Umax+g], PFl=PF[(size_t)l*Umax+g];
-                    double GFl1=GF[(size_t)(l+1)*Umax+g], PFl1=PF[(size_t)(l+1)*Umax+g];
-                    double XG=GFl1*KF1 - GFl*KF*eg*om, XP=PFl1*KF1 - PFl*KF*eg*om;
-                    double GBl1, PBl1;
-                    if(l+1==N-1){ GBl1=1.0; PBl1=0.0; }
-                    else { GBl1=GB[(size_t)(l+1)*Umax+g]; PBl1=PB[(size_t)(l+1)*Umax+g]; }
-                    double contrib = GBl1*XG*sz[g] + GBl1*XP*Saent[g] + PBl1*XG*Sw[g] + PBl1*XP*Saw[g];
-                    ccpop[pg[g]] += contrib;
+                    double eg=Er1[g];
+                    double XG=GFr1[g]*KF1 - GFr[g]*KF*eg*om, XP=PFr1[g]*KF1 - PFr[g]*KF*eg*om;
+                    double GBl1,PBl1; if(l+1==N-1){GBl1=1.0;PBl1=0.0;} else {GBl1=GBp[g];PBl1=PBp[g];}
+                    ccpop[pg[g]] += GBl1*XG*sz[g] + GBl1*XP*Saent[g] + PBl1*XG*Sw[g] + PBl1*XP*Saw[g];
                 }
-            } else { /* block-boundary locus, O(K) per-donor */
-                if(b+1>=nb) continue; /* last block: eb-1==N-1 skipped above */
-                int *gb2=gidB+(size_t)(b+1)*K; double *ent2=AENTRY+(size_t)(b+1)*K, *w2=WB+(size_t)(b+1)*K;
+            } else if(b+1<nb){   /* boundary locus l=eb-1: per-donor O(K), c_{l+1}=CEXIT[b+1] */
+                int *gb2=gidB+(size_t)(b+1)*K; double *ent2=AENTRY+(size_t)(b+1)*K, *cx2=CEXIT+(size_t)(b+1)*K;
+                double *GF2=GF+off[b+1], *PF2=PF+off[b+1];   /* row 0 = block b+1 first locus (=eb) */
                 for(int i=0;i<K;i++){
                     int g=gb[i], g2=gb2[i];
-                    double a_l = GF[(size_t)l*Umax+g] + PF[(size_t)l*Umax+g]*ent[i];
-                    double a_lp1 = GF[(size_t)(l+1)*Umax+g2] + PF[(size_t)(l+1)*Umax+g2]*ent2[i];
-                    double c_lp1 = GB[(size_t)(l+1)*Umax+g2] + PB[(size_t)(l+1)*Umax+g2]*w2[i];
-                    ccpop[pop_vec[i]] += a_lp1*c_lp1*KF1 - a_l*c_lp1*KF*EM(l+1, i)*om;
+                    double a_l=GFr[g]+PFr[g]*ent[i];
+                    double a_lp1=GF2[g2]+PF2[g2]*ent2[i];
+                    ccpop[pop_vec[i]] += a_lp1*cx2[i]*KF1 - a_l*cx2[i]*KF*EM(l+1,i)*om;
                 }
             }
+            { double *t; t=GBp;GBp=GBc;GBc=t; t=PBp;PBp=PBc;PBc=t; }   /* GBp now = GB[l] */
         }
+        double *cxb=CEXIT+(size_t)b*K;
+        for(int i=0;i<K;i++){ int g=gb[i]; double cv=GBp[g]+PBp[g]*w[i]; cexit[i]=cv; cxb[i]=cv; }
     }
-    free(Saw);
-    /* start term, O(K) */
-    { double k0=exp(Bs[1]-Asf); int *gb0=gidB; double *ent0=AENTRY, *w0=WB;
-      for(int i=0;i<K;i++){ int g=gb0[i];
-        double a0=GF[g]+PF[g]*ent0[i], c0=GB[g]+PB[g]*w0[i];
-        ccpop[pop_vec[i]] += a0*c0*k0; } }
+    /* start term: a_0=GF[0], c_0=CEXIT[0] */
+    { double k0=exp(Bs[1]-Asf); int *gb0=gidB; double *ent0=AENTRY, *cx0=CEXIT; double *GF0=GF+off[0], *PF0=PF+off[0];
+      for(int i=0;i<K;i++){ int g=gb0[i]; double a0=GF0[g]+PF0[g]*ent0[i]; ccpop[pop_vec[i]] += a0*cx0[i]*k0; } }
 
-    free(GF);free(PF);free(GB);free(PB);free(AENTRY);free(WB);free(As);free(Bs);
-    free(G);free(P);free(SentS);free(SwS);free(aprev);free(cexit);
+    free(off);free(GF);free(PF);free(Eg);free(AENTRY);free(WB);free(CEXIT);free(As);free(Bs);
+    free(SentS);free(SwS);free(G);free(P);free(GBp);free(PBp);free(GBc);free(PBc);free(Saw);free(aprev);free(cexit);
     return 0;
 }
 
