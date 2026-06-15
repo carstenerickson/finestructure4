@@ -42,7 +42,7 @@ static void fill_E(double *E, int rr){
     const uint8_t *rh = recip + (size_t)rr*N;
     for(int l=0;l<N;l++){
         int r = rh[l];
-        for(int i=0;i<K;i++) E[(size_t)l*K+i] = emis(r, donors[(size_t)i*N+l]);
+        for(int i=0;i<K;i++) E[(size_t)l*K+i] = emis(r, donors[(size_t)l*K+i]);
     }
 }
 
@@ -118,8 +118,7 @@ static Groups build_groups(int B){
         int U=0;
         for(int i=0;i<K;i++){
             for(int w=0;w<W;w++) key[w]=0;
-            const uint8_t *di=donors+(size_t)i*N;
-            for(int l=sb;l<eb;l++){ int bp=2*(l-sb); key[bp>>6]|=(uint64_t)(di[l]&3)<<(bp&63); }
+            for(int l=sb;l<eb;l++){ int bp=2*(l-sb); key[bp>>6]|=(uint64_t)(donors[(size_t)l*K+i]&3)<<(bp&63); }
             key[W-1]=(uint64_t)pop_vec[i];
             uint64_t h=1469598103934665603ULL; for(int w=0;w<W;w++) h=(h^key[w])*1099511628211ULL;
             int slot=h&(cap-1);
@@ -149,7 +148,7 @@ static void free_groups(Groups *G){ free(G->blk);free(G->gidB);free(G->sizeg);fr
    O(K)-per-block boundaries - NOT the full O(N*K) matrix the dense engine fills. */
 static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups *Gr){
     const uint8_t *rh = recip + (size_t)rr*N;
-    #define EM(L,II) emis(rh[(L)], donors[(size_t)(II)*N+(L)])
+    #define EM(L,II) emis(rh[(L)], donors[(size_t)(L)*K+(II)])
     int nb=Gr->nb, Umax=Gr->Umax; Block *blk=Gr->blk; int *gidB=Gr->gidB;
     int *sizeg=Gr->sizeg, *repg=Gr->repg, *popg=Gr->popg;
     /* malloc not calloc: only [0,U_block) of each locus row is written+read, so
@@ -158,17 +157,19 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
     double *GB=malloc((size_t)N*Umax*sizeof(double)), *PB=malloc((size_t)N*Umax*sizeof(double));
     double *AENTRY=malloc(sizeof(double)*(size_t)nb*K), *WB=malloc(sizeof(double)*(size_t)nb*K);
     double *As=malloc(sizeof(double)*N), *Bs=malloc(sizeof(double)*N);
-    double *G=malloc(sizeof(double)*Umax), *P=malloc(sizeof(double)*Umax), *Sx=malloc(sizeof(double)*Umax);
+    double *G=malloc(sizeof(double)*Umax), *P=malloc(sizeof(double)*Umax);
+    /* per-block group moments stored from the fwd/bwd passes (Saent==fwd Sentry,
+       Sw==bwd Sw): reused in chunkcount so it only needs Saw - no recompute. */
+    double *SentS=malloc((size_t)nb*Umax*sizeof(double)), *SwS=malloc((size_t)nb*Umax*sizeof(double));
 
-    /* FORWARD: store GF/PF, materialize AENTRY (block entry = a_{sblk-1}) */
+    /* FORWARD: store GF/PF + Sentry; materialize AENTRY (block entry = a_{sblk-1}) */
     double *aprev=calloc(K,sizeof(double));
     for(int b=0;b<nb;b++){
         int sb=blk[b].s, eb=blk[b].e, U=blk[b].U; int *gb=gidB+(size_t)b*K;
         int *sz=sizeg+(size_t)b*Umax, *rp=repg+(size_t)b*Umax;
-        double *ent=AENTRY+(size_t)b*K;
-        for(int i=0;i<K;i++) ent[i]= (b==0)?0.0:aprev[i];
+        double *ent=AENTRY+(size_t)b*K, *Sx=SentS+(size_t)b*Umax;
         for(int g=0;g<U;g++) Sx[g]=0.0;
-        if(b>0) for(int i=0;i<K;i++) Sx[gb[i]] += aprev[i];
+        for(int i=0;i<K;i++){ double a=(b==0)?0.0:aprev[i]; ent[i]=a; if(b>0) Sx[gb[i]]+=a; } /* fused copy+Sentry */
         for(int l=sb;l<eb;l++){
             double rlm1 = (l>=2)? exp(As[l-2]-As[l-1]) : ((l==1)?exp(-As[0]):0.0);
             for(int g=0;g<U;g++){
@@ -182,7 +183,6 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
             double s = (l<N-1)? sumA*T[l] : sumA;
             As[l] = (l>=1?As[l-1]:0.0) + log(s);
         }
-        /* materialize a_{eb-1} -> aprev for next block */
         for(int i=0;i<K;i++){ int g=gb[i]; aprev[i]= GF[(size_t)(eb-1)*Umax+g] + PF[(size_t)(eb-1)*Umax+g]*ent[i]; }
     }
 
@@ -193,10 +193,9 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
         int sb=blk[b].s, eb=blk[b].e, U=blk[b].U; int *gb=gidB+(size_t)b*K;
         int *sz=sizeg+(size_t)b*Umax, *rp=repg+(size_t)b*Umax;
         int top = (eb-1 < N-2)? eb-1 : N-2;
-        double *w=WB+(size_t)b*K;
-        for(int i=0;i<K;i++) w[i]= EM(top+1, i)*cexit[i];
+        double *w=WB+(size_t)b*K, *Sx=SwS+(size_t)b*Umax;
         for(int g=0;g<U;g++) Sx[g]=0.0;
-        for(int i=0;i<K;i++) Sx[gb[i]] += w[i];
+        for(int i=0;i<K;i++){ double wi=EM(top+1, i)*cexit[i]; w[i]=wi; Sx[gb[i]]+=wi; } /* fused w+Sw */
         for(int l=top;l>=sb;l--){
             double rb = (l+2<=N-1)? exp(Bs[l+2]-Bs[l+1]) : exp(-Bs[N-1]);
             for(int g=0;g<U;g++){
@@ -213,13 +212,15 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
 
     /* CHUNKCOUNT: O(N*U) interior bilinear + O(K) boundary + start */
     double Asf=As[N-1];
+    double *Saw=malloc(sizeof(double)*Umax);   /* alloc once; Saent/Sw reused from fwd/bwd */
     for(int p=0;p<npop;p++) ccpop[p]=0.0;
     for(int b=0;b<nb;b++){
         int sb=blk[b].s, eb=blk[b].e, U=blk[b].U; int *gb=gidB+(size_t)b*K;
         int *sz=sizeg+(size_t)b*Umax, *rp=repg+(size_t)b*Umax, *pg=popg+(size_t)b*Umax;
         double *ent=AENTRY+(size_t)b*K, *w=WB+(size_t)b*K;
-        double *Saent=calloc(U,sizeof(double)), *Sw=calloc(U,sizeof(double)), *Saw=calloc(U,sizeof(double));
-        for(int i=0;i<K;i++){ int g=gb[i]; Saent[g]+=ent[i]; Sw[g]+=w[i]; Saw[g]+=ent[i]*w[i]; }
+        double *Saent=SentS+(size_t)b*Umax, *Sw=SwS+(size_t)b*Umax;   /* reused (no recompute) */
+        for(int g=0;g<U;g++) Saw[g]=0.0;
+        for(int i=0;i<K;i++){ int g=gb[i]; Saw[g]+=ent[i]*w[i]; }      /* only Saw is fresh */
         for(int l=sb;l<eb;l++){
             if(l==N-1) continue;
             double BsR=(l+2<=N-1)?Bs[l+2]:0.0, Asm1=(l>=1)?As[l-1]:0.0;
@@ -248,8 +249,8 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
                 }
             }
         }
-        free(Saent); free(Sw); free(Saw);
     }
+    free(Saw);
     /* start term, O(K) */
     { double k0=exp(Bs[1]-Asf); int *gb0=gidB; double *ent0=AENTRY, *w0=WB;
       for(int i=0;i<K;i++){ int g=gb0[i];
@@ -257,7 +258,7 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
         ccpop[pop_vec[i]] += a0*c0*k0; } }
 
     free(GF);free(PF);free(GB);free(PB);free(AENTRY);free(WB);free(As);free(Bs);
-    free(G);free(P);free(Sx);free(aprev);free(cexit);
+    free(G);free(P);free(SentS);free(SwS);free(aprev);free(cexit);
     return 0;
 }
 
@@ -267,7 +268,10 @@ int main(int argc, char**argv){
     FILE *f=fopen(argv[1],"rb"); if(!f){perror("open");return 1;}
     int hdr[4]; fread(hdr,sizeof(int),4,f); K=hdr[0];N=hdr[1];npop=hdr[2];nrecip=hdr[3];
     double par[3]; fread(par,sizeof(double),3,f); rhobar=par[0];mut=par[1];copyprob=par[2];
-    donors=malloc((size_t)K*N); fread(donors,1,(size_t)K*N,f);
+    { uint8_t *drm=malloc((size_t)K*N); fread(drm,1,(size_t)K*N,f);
+      donors=malloc((size_t)N*K); /* transpose to locus-major [N][K] */
+      for(int i=0;i<K;i++) for(int l=0;l<N;l++) donors[(size_t)l*K+i]=drm[(size_t)i*N+l];
+      free(drm); }
     recip=malloc((size_t)nrecip*N); fread(recip,1,(size_t)nrecip*N,f);
     pos=malloc(sizeof(double)*N); fread(pos,sizeof(double),N,f);
     lam=malloc(sizeof(double)*N); fread(lam,sizeof(double),N,f);
@@ -281,27 +285,30 @@ int main(int argc, char**argv){
     double *a=malloc(sizeof(double)*(size_t)N*K), *c=malloc(sizeof(double)*(size_t)N*K);
     double *As=malloc(sizeof(double)*N), *Bs=malloc(sizeof(double)*N), *cc=malloc(sizeof(double)*K);
     double dense_pp[16]={0}, fold_pp_tot[16]={0};
+    int reps = (argc>3)? atoi(argv[3]) : 7;       /* repeat timing, take MIN (denoise) */
 
-    /* DENSE timed (per recipient: E fill + forward-backward-chunkcount) */
-    double t0=now_s();
-    for(int r=0;r<nrecip;r++){ fill_E(E,r); for(int i=0;i<K;i++)cc[i]=0.0;
-        dense_cc(E,cc,a,c,As,Bs); for(int i=0;i<K;i++) dense_pp[pop_vec[i]]+=cc[i]; }
-    double td=now_s()-t0;
-
-    /* GROUPING built ONCE (panel-fixed, target-independent - amortizes over recipients) */
-    double tg0=now_s(); Groups G=build_groups(B); double tg=now_s()-tg0;
+    Groups G=build_groups(B);   /* (timed below; here for the correctness pass) */
     { long sumU=0, slots=0; for(int b=0;b<G.nb;b++){ sumU+=G.blk[b].U; slots+=(long)(G.blk[b].e-G.blk[b].s)*G.blk[b].U; }
       printf("  grouping: %d blocks, Umean=%.1f (vs K=%d -> fold ratio %.1fx), interior slots N*Umean=%ld vs N*K=%ld\n",
              G.nb, (double)sumU/G.nb, K, (double)K/((double)sumU/G.nb), slots, (long)N*K); }
 
-    /* FOLD timed (per recipient: O(N*U) fold, emissions computed lazily per-group;
-       NO O(N*K) emission fill - that's the dense engine's intrinsic cost, not the fold's) */
-    double t1=now_s();
-    double fold_pp[16];
-    for(int r=0;r<nrecip;r++){
-        for(int p=0;p<npop;p++) fold_pp[p]=0.0;
-        fold_cc(r,fold_pp,&G); for(int p=0;p<npop;p++) fold_pp_tot[p]+=fold_pp[p]; }
-    double tf=now_s()-t1;
+    /* correctness pass (once) */
+    for(int r=0;r<nrecip;r++){ fill_E(E,r); for(int i=0;i<K;i++)cc[i]=0.0;
+        dense_cc(E,cc,a,c,As,Bs); for(int i=0;i<K;i++) dense_pp[pop_vec[i]]+=cc[i]; }
+    { double fp[16]; for(int r=0;r<nrecip;r++){ for(int p=0;p<npop;p++)fp[p]=0.0;
+        fold_cc(r,fp,&G); for(int p=0;p<npop;p++) fold_pp_tot[p]+=fp[p]; } }
+
+    /* timing: min over reps (dense incl E fill; fold lazy emissions; grouping once) */
+    double td=1e30, tf=1e30, tg=1e30; double fp[16];
+    for(int it=0; it<reps; it++){
+        double t0=now_s();
+        for(int r=0;r<nrecip;r++){ fill_E(E,r); dense_cc(E,cc,a,c,As,Bs); }
+        double d=now_s()-t0; if(d<td)td=d;
+        double tg0=now_s(); Groups Gt=build_groups(B); double g=now_s()-tg0; if(g<tg)tg=g; free_groups(&Gt);
+        double t1=now_s();
+        for(int r=0;r<nrecip;r++){ for(int p=0;p<npop;p++)fp[p]=0.0; fold_cc(r,fp,&G); }
+        double ff=now_s()-t1; if(ff<tf)tf=ff;
+    }
     free_groups(&G);
 
     printf("cpfold  K=%d N=%d npop=%d nrecip=%d  block=%d\n",K,N,npop,nrecip,B);
