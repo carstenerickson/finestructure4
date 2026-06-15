@@ -85,15 +85,7 @@ static void dense_cc(const double *E, double *cc /*[K], zeroed by caller*/,
         for(int i=0;i<K;i++) cc[i] += a0[i]*c0[i]*k0; }
 }
 
-/* ---------------- grouping (sort donors by (pop, block-substring)) ----------- */
-static int gsb, geb;
-static int cmp_donor(const void *pa, const void *pb){
-    int ia=*(const int*)pa, ib=*(const int*)pb;
-    if(pop_vec[ia]!=pop_vec[ib]) return pop_vec[ia]-pop_vec[ib];
-    const uint8_t *ra=donors+(size_t)ia*N, *rb=donors+(size_t)ib*N;
-    for(int l=gsb;l<geb;l++) if(ra[l]!=rb[l]) return (int)ra[l]-(int)rb[l];
-    return 0;
-}
+/* ---------------- grouping by (pop, block-substring): O(N*K) hash ------------ */
 
 /* ---------------- FOLDED engine (port of fold_ONU) -------------------------- */
 typedef struct { int s,e,U; } Block;
@@ -111,16 +103,36 @@ static Groups build_groups(int B){
     if(nb>=2 && (G.blk[nb-1].e-G.blk[nb-1].s)<2){ G.blk[nb-2].e=G.blk[nb-1].e; nb--; }
     G.nb=nb;
     G.gidB=malloc(sizeof(int)*(size_t)nb*K);
-    int *idx=malloc(sizeof(int)*K); int Umax=0;
+    /* O(N*K) grouping by hash on packed (alleles 2bit + pop) keys - no sort, no
+       O(B) comparator, no log K. Open-addressing table reused per block via a gen
+       stamp. Key = ceil(2B/64) allele words + 1 pop word. */
+    int W = (2*B + 63)/64 + 1;
+    int cap=1; while(cap < 4*K) cap<<=1;
+    uint64_t *htkey=malloc((size_t)cap*W*sizeof(uint64_t));
+    int *htgid=malloc(sizeof(int)*cap), *htstamp=calloc(cap,sizeof(int));
+    /* first pass: gid assignment + Umax + per-block U */
+    int *Ublk=malloc(sizeof(int)*nb), Umax=0, *repTmp=malloc(sizeof(int)*K), gen=0;
+    uint64_t key[16];
     for(int b=0;b<nb;b++){
-        gsb=G.blk[b].s; geb=G.blk[b].e;
-        for(int i=0;i<K;i++) idx[i]=i;
-        qsort(idx,K,sizeof(int),cmp_donor);
-        int U=0; int *gb=G.gidB+(size_t)b*K;
-        for(int t=0;t<K;t++){ if(t==0||cmp_donor(&idx[t],&idx[t-1])!=0) U++; gb[idx[t]]=U-1; }
-        G.blk[b].U=U; if(U>Umax)Umax=U;
+        int sb=G.blk[b].s, eb=G.blk[b].e; int *gb=G.gidB+(size_t)b*K; gen++;
+        int U=0;
+        for(int i=0;i<K;i++){
+            for(int w=0;w<W;w++) key[w]=0;
+            const uint8_t *di=donors+(size_t)i*N;
+            for(int l=sb;l<eb;l++){ int bp=2*(l-sb); key[bp>>6]|=(uint64_t)(di[l]&3)<<(bp&63); }
+            key[W-1]=(uint64_t)pop_vec[i];
+            uint64_t h=1469598103934665603ULL; for(int w=0;w<W;w++) h=(h^key[w])*1099511628211ULL;
+            int slot=h&(cap-1);
+            for(;;){
+                if(htstamp[slot]!=gen){ htstamp[slot]=gen; memcpy(htkey+(size_t)slot*W,key,W*sizeof(uint64_t));
+                    htgid[slot]=U; repTmp[U]=i; gb[i]=U; U++; break; }
+                if(memcmp(htkey+(size_t)slot*W,key,W*sizeof(uint64_t))==0){ gb[i]=htgid[slot]; break; }
+                slot=(slot+1)&(cap-1);
+            }
+        }
+        Ublk[b]=U; G.blk[b].U=U; if(U>Umax)Umax=U;
     }
-    free(idx); G.Umax=Umax;
+    G.Umax=Umax;
     G.sizeg=malloc(sizeof(int)*(size_t)nb*Umax); G.repg=malloc(sizeof(int)*(size_t)nb*Umax);
     G.popg=malloc(sizeof(int)*(size_t)nb*Umax);
     for(int b=0;b<nb;b++){ int U=G.blk[b].U; int *gb=G.gidB+(size_t)b*K;
@@ -128,6 +140,7 @@ static Groups build_groups(int B){
         for(int g=0;g<U;g++){sz[g]=0;rp[g]=-1;}
         for(int i=0;i<K;i++){int g=gb[i];sz[g]++; if(rp[g]<0){rp[g]=i;pg[g]=pop_vec[i];}}
     }
+    free(htkey);free(htgid);free(htstamp);free(Ublk);free(repTmp);
     return G;
 }
 static void free_groups(Groups *G){ free(G->blk);free(G->gidB);free(G->sizeg);free(G->repg);free(G->popg); }
