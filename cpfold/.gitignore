@@ -4,3 +4,6 @@ win*.recom
 out/
 __pycache__/
 *.cp.*
+cpfold
+*.bin
+*.o
