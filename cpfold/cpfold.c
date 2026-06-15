@@ -139,8 +139,10 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
     #define EM(L,II) emis(rh[(L)], donors[(size_t)(II)*N+(L)])
     int nb=Gr->nb, Umax=Gr->Umax; Block *blk=Gr->blk; int *gidB=Gr->gidB;
     int *sizeg=Gr->sizeg, *repg=Gr->repg, *popg=Gr->popg;
-    double *GF=calloc((size_t)N*Umax,sizeof(double)), *PF=calloc((size_t)N*Umax,sizeof(double));
-    double *GB=calloc((size_t)N*Umax,sizeof(double)), *PB=calloc((size_t)N*Umax,sizeof(double));
+    /* malloc not calloc: only [0,U_block) of each locus row is written+read, so
+       zeroing all N*Umax pages (which grows with block size) is pure waste. */
+    double *GF=malloc((size_t)N*Umax*sizeof(double)), *PF=malloc((size_t)N*Umax*sizeof(double));
+    double *GB=malloc((size_t)N*Umax*sizeof(double)), *PB=malloc((size_t)N*Umax*sizeof(double));
     double *AENTRY=malloc(sizeof(double)*(size_t)nb*K), *WB=malloc(sizeof(double)*(size_t)nb*K);
     double *As=malloc(sizeof(double)*N), *Bs=malloc(sizeof(double)*N);
     double *G=malloc(sizeof(double)*Umax), *P=malloc(sizeof(double)*Umax), *Sx=malloc(sizeof(double)*Umax);
@@ -275,6 +277,9 @@ int main(int argc, char**argv){
 
     /* GROUPING built ONCE (panel-fixed, target-independent - amortizes over recipients) */
     double tg0=now_s(); Groups G=build_groups(B); double tg=now_s()-tg0;
+    { long sumU=0, slots=0; for(int b=0;b<G.nb;b++){ sumU+=G.blk[b].U; slots+=(long)(G.blk[b].e-G.blk[b].s)*G.blk[b].U; }
+      printf("  grouping: %d blocks, Umean=%.1f (vs K=%d -> fold ratio %.1fx), interior slots N*Umean=%ld vs N*K=%ld\n",
+             G.nb, (double)sumU/G.nb, K, (double)K/((double)sumU/G.nb), slots, (long)N*K); }
 
     /* FOLD timed (per recipient: O(N*U) fold, emissions computed lazily per-group;
        NO O(N*K) emission fill - that's the dense engine's intrinsic cost, not the fold's) */
