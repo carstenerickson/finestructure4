@@ -148,6 +148,29 @@ def fold_forward(E, T, copyprob, donors, blocks):
     return a_rec, As
 
 
+def chunkcount_per_donor(a, As, c, Bs, E, T, copyprob):
+    """Per-donor corrected_chunk_count from the rescaled forward a + backward c.
+    cc[i] = sum_l (a_{l+1} c_{l+1} KF1_l - a_l c_{l+1} KF_l E[l+1] (1-T[l])) + start.
+      KF1_l = exp(As[l]   + BsR(l+2) - As[N-1]),  KF_l = exp(As[l-1] + BsR(l+2) - As[N-1])
+      start = a_0 c_0 exp(Bs[1] - As[N-1]);  As[-1]=0, BsR(N)=0, c[N-1]=1."""
+    N, K = E.shape
+    Asf = As[N - 1]
+    cc = np.zeros(K)
+    for l in range(N - 1):
+        BsR = Bs[l + 2] if l + 2 <= N - 1 else 0.0
+        Asm1 = As[l - 1] if l >= 1 else 0.0
+        KF1 = np.exp(As[l] + BsR - Asf)
+        KF = np.exp(Asm1 + BsR - Asf)
+        clp1 = c[l + 1]
+        cc += a[l + 1] * clp1 * KF1 - a[l] * clp1 * KF * E[l + 1] * (1 - T[l])
+    cc += a[0] * c[0] * np.exp(Bs[1] - Asf)
+    return cc
+
+
+def perpop(cc, dp, npop):
+    return np.array([cc[dp == p].sum() for p in range(npop)])
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
@@ -158,7 +181,7 @@ if __name__ == "__main__":
     ap.add_argument("--readNe", type=float, default=400000)
     ap.add_argument("--mut", type=float, default=0.0006338578)
     ap.add_argument("--block", type=int, default=50)
-    ap.add_argument("--hap", type=int, default=0)
+    ap.add_argument("--ref", default=None, help="fs cp .chunkcounts.out for binary comparison")
     a = ap.parse_args()
 
     arr, nhap, nsnp, pos = load_phase(a.phase)
@@ -167,19 +190,36 @@ if __name__ == "__main__":
     K = len(dr); donors = arr[dr]
     rhobar = a.readNe; copyprob = 1.0 / K
     d = pos[1:] - pos[:-1]; T = 1 - np.exp(-d * rhobar * lam[:-1])
-    newh = arr[a.hap]
-    E = emissions(newh, donors, a.mut)
 
     blocks = make_blocks(nsnp, a.block)
-    a_d, As_d = dense_forward(E, T, copyprob)
-    a_f, As_f = fold_forward(E, T, copyprob, donors, blocks)
-    c_d, Bs_d = dense_backward(E, T, copyprob)
-    c_f, Bs_f = fold_backward(E, T, copyprob, donors, blocks)
+    npop = len(popnames)
+    # per-pop chunkcount summed over both recipient haps, dense vs fold
+    cc_dense = np.zeros(npop); cc_fold = np.zeros(npop)
+    maxA = maxC = 0.0
+    for h in (recips[0][1], recips[0][2]):
+        Eh = emissions(arr[h], donors, a.mut)
+        a_d, As_d = dense_forward(Eh, T, copyprob)
+        a_f, As_f = fold_forward(Eh, T, copyprob, donors, blocks)
+        c_d, Bs_d = dense_backward(Eh, T, copyprob)
+        c_f, Bs_f = fold_backward(Eh, T, copyprob, donors, blocks)
+        maxA = max(maxA, (np.abs(a_f - a_d) / (np.abs(a_d) + 1e-300)).max())
+        maxC = max(maxC, (np.abs(c_f - c_d) / (np.abs(c_d) + 1e-300)).max())
+        cc_dense += perpop(chunkcount_per_donor(a_d, As_d, c_d, Bs_d, Eh, T, copyprob), dp, npop)
+        cc_fold += perpop(chunkcount_per_donor(a_f, As_f, c_f, Bs_f, Eh, T, copyprob), dp, npop)
 
-    relA = np.abs(a_f - a_d) / (np.abs(a_d) + 1e-300)
-    relC = np.abs(c_f - c_d) / (np.abs(c_d) + 1e-300)
-    print(f"FOLD vs DENSE  N={nsnp} K={K} block={a.block} nblocks={len(blocks)}")
-    print(f"  forward  per-donor a_l(i) max rel err = {relA.max():.3e}")
-    print(f"  backward per-donor c_l(i) max rel err = {relC.max():.3e}")
-    ok = relA.max() < 1e-9 and relC.max() < 1e-9
-    print("VERDICT:", "PASS - forward + backward fold EXACT" if ok else "FAIL")
+    print(f"FOLD vs DENSE  N={nsnp} K={K} block={a.block} nblocks={len(blocks)} pops={popnames}")
+    print(f"  state fold: max rel err  forward a={maxA:.2e}  backward c={maxC:.2e}")
+    relCC = (np.abs(cc_fold - cc_dense) / (np.abs(cc_dense) + 1e-300)).max()
+    print(f"  chunkcount dense: " + " ".join(f"{v:.6f}" for v in cc_dense))
+    print(f"  chunkcount fold : " + " ".join(f"{v:.6f}" for v in cc_fold))
+    print(f"  fold-vs-dense chunkcount max rel err = {relCC:.3e}")
+    if a.ref:
+        with open(a.ref) as f:
+            hdr = f.readline().split()[1:]; row = f.readline().split()
+            refv = np.array([float(x) for x in row[1:]])
+        idx = [popnames.index(p) for p in hdr]
+        relbin = (np.abs(cc_fold[idx] - refv) / (np.abs(refv) + 1e-300)).max()
+        print(f"  binary ({hdr}): " + " ".join(f"{v:.6f}" for v in refv))
+        print(f"  fold-vs-BINARY max rel err = {relbin:.3e}")
+    ok = maxA < 1e-9 and maxC < 1e-9 and relCC < 1e-9
+    print("VERDICT:", "PASS - fold reproduces dense chunkcounts EXACTLY" if ok else "FAIL")
