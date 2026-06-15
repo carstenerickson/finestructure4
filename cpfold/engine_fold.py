@@ -46,6 +46,61 @@ def make_blocks(N, B):
     return [(s, min(s + B, N)) for s in range(0, N, B)]
 
 
+def dense_backward(E, T, copyprob):
+    """Rescaled backward c_l(i) (=1 + (1-T)*e*rb*c_{l+1}) + Bs[l] cumulative.
+    c[N-1]=1. Matches oracle_dense backward (Sampler.c L185-295)."""
+    N, K = E.shape
+    c = np.empty((N, K)); Bs = np.empty(N)
+    c[N - 1] = 1.0
+    Bs[N - 1] = np.log(np.sum(T[N - 2] * copyprob * E[N - 1]))   # init Betasum
+    for l in range(N - 2, -1, -1):
+        rb = np.exp(Bs[l + 2] - Bs[l + 1]) if l + 2 <= N - 1 else np.exp(-Bs[N - 1])
+        c[l] = 1.0 + (1 - T[l]) * E[l + 1] * rb * c[l + 1]
+        if l > 0:
+            Bs[l] = Bs[l + 1] + np.log(np.sum(T[l - 1] * copyprob * E[l] * c[l]))
+        else:
+            Bs[0] = Bs[1]   # not used; keep array filled
+    return c, Bs
+
+
+def fold_backward(E, T, copyprob, donors, blocks):
+    """Folded backward. c_l(i) within a block is affine in the boundary product
+    w(i) = E[eblk](i)*c_{eblk}(i): the top locus uses E[eblk] (next block, NOT
+    group-constant), so the per-donor E[eblk] must be carried in w, not folded."""
+    N, K = E.shape
+    c_rec = np.empty((N, K)); Bs = np.empty(N)
+    c_rec[N - 1] = 1.0
+    Bs[N - 1] = np.log(np.sum(T[N - 2] * copyprob * E[N - 1]))
+    cexit_full = np.ones(K)          # c_{eblk}(i); rightmost seed c[N-1]=1
+    for (sblk, eblk) in reversed(blocks):
+        sub = donors[:, sblk:eblk]
+        _, gid = np.unique(sub, axis=0, return_inverse=True)
+        gid = gid.ravel(); U = gid.max() + 1
+        size_g = np.bincount(gid, minlength=U).astype(float)
+        rep = np.zeros(U, dtype=int); rep[gid] = np.arange(K)
+        top = min(eblk - 1, N - 2)                   # l=N-1 is the seed c=1
+        # boundary product carried per-donor: w(i) = E[top+1](i) * c_{top+1}(i)
+        w_full = E[top + 1] * cexit_full
+        Sw = np.bincount(gid, weights=w_full, minlength=U)
+        GB = np.zeros(U); PB = np.zeros(U)
+        for l in range(top, sblk - 1, -1):
+            rb = np.exp(Bs[l + 2] - Bs[l + 1]) if l + 2 <= N - 1 else np.exp(-Bs[N - 1])
+            if l == top:
+                GB = np.ones(U)
+                PB = np.full(U, (1 - T[l]) * rb)     # scalar: E[top+1] absorbed into w
+            else:
+                fac = (1 - T[l]) * E[l + 1][rep] * rb   # E[l+1] in-block, group-constant
+                GB = 1.0 + fac * GB
+                PB = fac * PB
+            if l > 0:
+                egl = E[l][rep]
+                sB = np.sum(egl * (size_g * GB + PB * Sw))
+                Bs[l] = Bs[l + 1] + np.log(T[l - 1] * copyprob * sB)
+            c_rec[l] = GB[gid] + PB[gid] * w_full
+        cexit_full = c_rec[sblk]                     # c_{sblk} = exit for next (leftward) block
+    return c_rec, Bs
+
+
 def fold_forward(E, T, copyprob, donors, blocks):
     """Folded forward. Returns reconstructed a[N,K] and As[N] (O(N*U+(N/B)*K))."""
     N, K = E.shape
@@ -115,15 +170,16 @@ if __name__ == "__main__":
     newh = arr[a.hap]
     E = emissions(newh, donors, a.mut)
 
-    a_d, As_d = dense_forward(E, T, copyprob)
     blocks = make_blocks(nsnp, a.block)
+    a_d, As_d = dense_forward(E, T, copyprob)
     a_f, As_f = fold_forward(E, T, copyprob, donors, blocks)
+    c_d, Bs_d = dense_backward(E, T, copyprob)
+    c_f, Bs_f = fold_backward(E, T, copyprob, donors, blocks)
 
     relA = np.abs(a_f - a_d) / (np.abs(a_d) + 1e-300)
-    relS = np.abs(As_f - As_d) / (np.abs(As_d) + 1e-300)
-    print(f"FOLD FORWARD vs DENSE  N={nsnp} K={K} block={a.block} nblocks={len(blocks)}")
-    print(f"  per-donor a_l(i) max rel err = {relA.max():.3e}")
-    print(f"  cumulative As_l  max rel err = {relS.max():.3e}")
-    print(f"  final loglik  dense={As_d[-1]:.8f} fold={As_f[-1]:.8f}")
-    ok = relA.max() < 1e-9
-    print("VERDICT:", "PASS - forward fold is EXACT (affine block decomposition)" if ok else "FAIL")
+    relC = np.abs(c_f - c_d) / (np.abs(c_d) + 1e-300)
+    print(f"FOLD vs DENSE  N={nsnp} K={K} block={a.block} nblocks={len(blocks)}")
+    print(f"  forward  per-donor a_l(i) max rel err = {relA.max():.3e}")
+    print(f"  backward per-donor c_l(i) max rel err = {relC.max():.3e}")
+    ok = relA.max() < 1e-9 and relC.max() < 1e-9
+    print("VERDICT:", "PASS - forward + backward fold EXACT" if ok else "FAIL")
