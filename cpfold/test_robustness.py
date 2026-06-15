@@ -42,6 +42,20 @@ def main():
         rel = (np.abs(cco - ccd) / (np.abs(ccd) + 1e-300)).max()
         print(f"  block={B}: fold-vs-dense WITH 9s max rel err = {rel:.3e}")
 
+    # block-size robustness: include N%B==1 triggers (would zero the backward seed
+    # pre-fix, F1) and single-block; make_blocks merges length-1 trailing blocks.
+    print("BLOCK-SIZE ROBUSTNESS (incl. N%B==1 triggers + single block):")
+    for B in (50, 999, 1999, N):
+        blocks = make_blocks(N, B)
+        ccd = np.zeros(npop); cco = np.zeros(npop)
+        for h in (recips[0][1], recips[0][2]):
+            Eh = emissions(arr[h], arr[dr], 0.0006338578)
+            ad, Asd = dense_forward(Eh, T, cprob); cd, Bsd = dense_backward(Eh, T, cprob)
+            ccd += perpop(chunkcount_per_donor(ad, Asd, cd, Bsd, Eh, T, cprob), dp, npop)
+            cc, _, _ = fold_ONU(Eh, T, cprob, arr[dr], dp, npop, blocks); cco += cc
+        rel = (np.abs(cco - ccd) / (np.abs(ccd) + 1e-300)).max()
+        print(f"  B={B} ({len(blocks)} blocks, N%B={N % B}): fold-vs-dense max rel err = {rel:.2e}")
+
     donors = arr[dr]; Eh = emissions(arr[recips[0][1]], donors, 0.0006338578)
     blocks = make_blocks(N, 50)
     t = time.time()

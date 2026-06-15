@@ -43,7 +43,15 @@ def dense_forward(E, T, copyprob):
 
 
 def make_blocks(N, B):
-    return [(s, min(s + B, N)) for s in range(0, N, B)]
+    """Partition [0,N) into blocks of size B. The backward seed locus N-1 needs a
+    recurrence partner, so a length-1 trailing block (N % B == 1) is illegal -
+    merge it into the previous block. (B>=2 required; B=1 is degenerate.)"""
+    if B < 2:
+        raise ValueError("block size B must be >= 2")
+    blocks = [(s, min(s + B, N)) for s in range(0, N, B)]
+    if len(blocks) >= 2 and blocks[-1][1] - blocks[-1][0] < 2:
+        blocks[-2] = (blocks[-2][0], blocks[-1][1]); blocks.pop()
+    return blocks
 
 
 def dense_backward(E, T, copyprob):
@@ -336,10 +344,15 @@ if __name__ == "__main__":
     print(f"  chunkcount dense: " + " ".join(f"{v:.6f}" for v in cc_dense))
     print(f"  chunkcount fold : " + " ".join(f"{v:.6f}" for v in cc_onu))
     print(f"  fold-vs-dense chunkcount max rel err = {relCC:.3e}")
-    dense_ops = (nsnp - 1) * K * 2          # dense chunkcount inner work (2 haps)
-    fold_ops = tot_iops + tot_bops
-    print(f"  inner-loop ops: dense~{dense_ops:,}  fold~{fold_ops:,} "
-          f"(interior {tot_iops:,} + boundary {tot_bops:,})  -> {dense_ops/max(fold_ops,1):.1f}x")
+    # op-count proxy: count the fold's per-block bincount reductions (3*K each)
+    # honestly, and compare CHUNK-COUNT-only work on both sides (apples-to-apples).
+    bincount_ops = 3 * K * len(blocks) * 2          # Saent/Sw/Saw per block, 2 haps
+    dense_ops = (nsnp - 1) * K * 2                  # dense chunkcount inner loop
+    fold_ops = tot_iops + tot_bops + bincount_ops
+    print(f"  chunkcount-only ops: dense~{dense_ops:,}  fold~{fold_ops:,} "
+          f"(interior {tot_iops:,} + boundary {tot_bops:,} + bincounts {bincount_ops:,}) "
+          f"-> {dense_ops/max(fold_ops,1):.1f}x  (asymptotic full-pipeline O(NK)->O(NU) is larger)")
+    relbin = None
     if a.ref:
         with open(a.ref) as f:
             hdr = f.readline().split()[1:]; row = f.readline().split()
@@ -347,6 +360,12 @@ if __name__ == "__main__":
         idx = [popnames.index(p) for p in hdr]
         relbin = (np.abs(cc_fold[idx] - refv) / (np.abs(refv) + 1e-300)).max()
         print(f"  binary ({hdr}): " + " ".join(f"{v:.6f}" for v in refv))
-        print(f"  fold-vs-BINARY max rel err = {relbin:.3e}")
+        print(f"  fold-vs-BINARY max rel err = {relbin:.3e}  "
+              f"(oracle FP drift grows ~linearly with N; ~3e-7 print-quantum floor; "
+              f"{'OK' if relbin < 5e-6 else 'EXCEEDS oracle gate - FP accumulation at this N, NOT a fold bug since fold==dense above'})")
+    # the fold-EXACTNESS claim is fold==dense; the oracle-FIDELITY claim is fold==binary.
+    # Report them separately - do NOT let an exact fold mask an oracle-vs-binary drift.
     ok = relCC < 1e-9
-    print("VERDICT:", "PASS - O(N*U) fold reproduces dense chunkcounts EXACTLY" if ok else "FAIL")
+    binmsg = "" if relbin is None else (f"  [oracle-vs-binary {relbin:.1e}"
+             + ("" if relbin < 5e-6 else " - FP drift at this N, see note") + "]")
+    print(f"VERDICT: {'fold==dense EXACT (O(N*U))' if ok else 'FAIL - fold != dense'}{binmsg}")
