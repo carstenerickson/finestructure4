@@ -593,13 +593,15 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
   if(Par->use_fold){
     /* -fold: replace the O(N*K) dense FB with the exact O(N*Umean) block fold.
        Produces per-pop chunk counts (coancestry), expected chunk lengths,
-       expected_differences (for the -iM global-mutation EM update), N_e_new (for
-       the -in N_e EM update) and the forward log-likelihood, so -fold drives the
-       full -i N -in -iM EM loop. Per-pop totals are exact, distributed uniformly
-       within each donor pop so the per-pop output totals are reproduced. (regional
-       bootstrap + samples are not produced.) */
+       expected_differences (for the -im per-pop / -iM global mutation EM updates),
+       N_e_new (for the -in N_e EM update), the per-pop start term (for the -ip
+       copy-proportion EM update) and the forward log-likelihood, so -fold drives
+       the full -i N -ip -im -in -iM EM loop. Per-pop totals are exact, distributed
+       uniformly within each donor pop so the per-pop output totals are reproduced.
+       (regional bootstrap + samples are not produced.) */
     if(*p_Nloci < 2){ fprintf(Par->out,"ERROR: -fold requires at least 2 loci. Exiting...\n"); stop_on_error(1,Par->errormode,Par->err); }
     double *fpp=calloc(ndonorpops,sizeof(double)), *fdiff=calloc(ndonorpops,sizeof(double)), *flen=calloc(ndonorpops,sizeof(double));
+    double *fstart=calloc(ndonorpops,sizeof(double));
     int *cntp=calloc(ndonorpops,sizeof(int));
     for(i=0;i<*p_Nhaps;i++) cntp[pop_vec[i]]++;
     double tb=0,tf=0,foldloglik=0.0;
@@ -610,7 +612,7 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
     double *ecp_out = (finalrun && Outfiles->usingFile[8]) ? calloc((size_t)*p_Nloci*ndonorpops, sizeof(double)) : NULL;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
                   copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops,
-                  Par->fold_ustar, fpp, fdiff, flen, &N_e_new, &foldloglik, etp_out, ecp_out, &tb, &tf);
+                  Par->fold_ustar, fpp, fstart, fdiff, flen, &N_e_new, &foldloglik, etp_out, ecp_out, &tb, &tf);
     Alphasum = foldloglik;
     /* write the forward log-likelihood to .EMprobs.out, same column the dense
        writes at the matching point (keeps the EMPAR row layout identical). */
@@ -624,16 +626,28 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
                  for(int l=*p_Nloci-2; l>=0; l--) printCopyProbs(&ecp_out[(size_t)l*ndonorpops], ind_val, pos[l], Outfiles, Par);
                  free(ecp_out); }
     /* per-pop totals are exact; distributed uniformly within each donor pop so
-       total_counts / total_differences / total_lengths are reproduced. */
+       total_counts / total_differences / total_lengths are reproduced.
+       copy_prob_new / copy_prob_newSTART feed the copy-proportion EM update (-ip)
+       in loglik() (via total_back_prob / total_back_probSTART). The dense sets them
+       to the per-donor posterior on E-M iterations, but RESETS them to the prior
+       copy_prob / copy_probSTART on the final (sampling) run (the block guarded by
+       finalrun && !use_fold below), so .prop reports the EM-converged input
+       copy_prob, not the final run's posterior. Mirror that exactly:
+         - non-final E-M runs: per-pop POSTERIOR chunk count EXCLUDING the start
+           term (fpp-fstart) and the per-pop START term (fstart), each distributed
+           uniformly within pop, so the -ip update sees the dense per-pop totals.
+         - final run: the prior copy_prob / copy_probSTART. */
     for(i=0;i<*p_Nhaps;i++){ int p=pop_vec[i];
       corrected_chunk_count[i]=(cntp[p]>0)?fpp[p]/cntp[p]:0.0;
       expected_differences[i]=(cntp[p]>0)?fdiff[p]/cntp[p]:0.0;
       expected_chunk_length[i]=(cntp[p]>0)?flen[p]/cntp[p]:0.0;
-      copy_prob_new[i]=copy_prob[i]; copy_prob_newSTART[i]=copy_probSTART[i]; }
+      if(finalrun){ copy_prob_new[i]=copy_prob[i]; copy_prob_newSTART[i]=copy_probSTART[i]; }
+      else { copy_prob_new[i]=(cntp[p]>0)?(fpp[p]-fstart[p])/cntp[p]:0.0;
+             copy_prob_newSTART[i]=(cntp[p]>0)?fstart[p]/cntp[p]:0.0; } }
     for(i=0;i<ndonorpops;i++){ regional_chunk_count_sum_final[i]=0.0; regional_chunk_count_sum_squared_final[i]=0.0; snp_info_measure[i]=0.0; }
     num_regions=0;
     if(cpfold_env) fprintf(Par->out,"[CPFOLD-prod] N=%d K=%d Ustar=%d N_e=%.2f  fold=%.2f ms (+grouping %.2f ms)\n",*p_Nloci,*p_Nhaps,Par->fold_ustar,N_e_new,tf*1e3,tb*1e3);
-    free(fpp); free(fdiff); free(flen); free(cntp);
+    free(fpp); free(fdiff); free(flen); free(fstart); free(cntp);
   } else {
     Alphasum = use_lin
       ? forwardAlgorithmLin(newh, existing_h, Alphamat, Asvec, MutProb_vec, p_Nhaps,p_Nloci,copy_prob, copy_probSTART, TransProb,Par)
@@ -661,7 +675,7 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
     double t_build=0, t_fold=0, Ne_fold=0, ll_fold=0;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
                   copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops, Ustar,
-                  ccfold, cdfold, clfold, &Ne_fold, &ll_fold, NULL, NULL, &t_build, &t_fold);
+                  ccfold, NULL, cdfold, clfold, &Ne_fold, &ll_fold, NULL, NULL, &t_build, &t_fold);
     double mre=0,mrd=0,mrl=0; for(int p=0;p<ndonorpops;p++){
       double e=fabs(ccfold[p]-ccdense[p])/(fabs(ccdense[p])+1e-300); if(e>mre)mre=e;
       double d=fabs(cdfold[p]-cddense[p])/(fabs(cddense[p])+1e-300); if(d>mrd)mrd=d;

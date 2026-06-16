@@ -8,9 +8,11 @@
  * Produces per-population chunk counts, expected differences, expected chunk
  * lengths, the N_e (-in) and global-mutation (-iM) E-M quantities, and the forward
  * log-likelihood. Exact for uniform copy_prob + global mutation and for FIXED
- * per-population copy_prob (-p) / mutation (-m); does not run per-pop E-M updates
- * (-ip/-im) or sampling (-s>0). Reuses the caller's exact TransProb so the
- * transition is identical to the dense.
+ * per-population copy_prob (-p) / mutation (-m). It also returns the per-pop start
+ * term separately, so the caller can drive the full per-pop E-M loop - copy
+ * proportions (-ip) and per-pop mutation (-im, from the expected differences) -
+ * exactly; it does not produce samples (-s>0). Reuses the caller's exact TransProb
+ * so the transition is identical to the dense.
  *
  * cpfold_perpop() is the entry point called from sampler() under -fold.
  */
@@ -121,7 +123,7 @@ static Groups build_groups_adaptive(int Ustar, int bypop){
    Direct port of cpfold.c fold_cc; rh = the recipient allele row. */
 /* etp_out[N-1] (per-locus transition prob, for -d) and ecp_out[N*npop] (per-locus
    per-pop copy posterior, for -b) are optional: filled only when non-NULL. */
-static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nlen, double *Ne_out, double *loglik_out, double *etp_out, double *ecp_out, Groups *Gr){
+static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *ndiff, double *nlen, double *Ne_out, double *loglik_out, double *etp_out, double *ecp_out, Groups *Gr){
     #define EM(L,II) cp_emis(rh[(L)], donors[(size_t)(L)*K+(II)], cf_mut[(II)])
     int nb=Gr->nb, Umax=Gr->Umax; Block *blk=Gr->blk; int *gidB=Gr->gidB;
     int *sizeg=Gr->sizeg, *repg=Gr->repg;
@@ -174,6 +176,7 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
 
     double Asf=As[N-1];
     for(int p=0;p<npop;p++) ccpop[p]=0.0;
+    if(startpop) for(int p=0;p<npop;p++) startpop[p]=0.0;
     /* EM quantities (-in N_e, -iM global mutation), verified fold (wf wxk7vegbf):
        N_e from per-locus etp (the chunkcount total) rho-weighted by the dense gd_l;
        per-pop expected_differences from e_a_l_bc=a_l*c_l*KC folded over the moments. */
@@ -263,7 +266,11 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
         for(int i=0;i<K;i++){ int g=gb[i]; double cv=GBp[g]+PBp[g]*w[i]; cexit[i]=cv; cxb[i]=cv; }
     }
     { double k0=exp(Bs[1]-Asf); int *gb0=gidB; double *ent0=AENTRY, *cx0=CEXIT; double *GF0=GF+off[0], *PF0=PF+off[0];
-      for(int i=0;i<K;i++){ int g=gb0[i]; double a0=GF0[g]+PF0[g]*ent0[i]; ccpop[pop_vec[i]] += a0*cx0[i]*k0; } }
+      /* start term (= dense copy_prob_newSTART, the locus-0 posterior): folded into
+         ccpop to give the full corrected chunk count, and reported separately in
+         startpop so the caller can split off the no-start copy_prob_new (-ip). */
+      for(int i=0;i<K;i++){ int g=gb0[i]; double a0=GF0[g]+PF0[g]*ent0[i]; double st=a0*cx0[i]*k0;
+        ccpop[pop_vec[i]] += st; if(startpop) startpop[pop_vec[i]] += st; } }
 
     *Ne_out = (tot_gd>0.0) ? tot_prob_Ne/tot_gd : 0.0;   /* N_e EM estimate (-in); dense floor */
     if(*Ne_out < MIN_NE) *Ne_out = MIN_NE;
@@ -282,7 +289,7 @@ void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
                    double *TransProb, double *MutProb_vec, double *copy_prob, double *copy_probSTART,
                    double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
-                   double *out_ccpop, double *out_ndiff, double *out_nlen, double *out_Ne,
+                   double *out_ccpop, double *out_start, double *out_ndiff, double *out_nlen, double *out_Ne,
                    double *out_loglik, double *out_etp, double *out_ecp, double *t_build, double *t_fold){
     K=nhaps; N=nloci; npop=ndonorpops;
     cf_cp=copy_prob; cf_cps=copy_probSTART; cf_mut=MutProb_vec;
@@ -302,7 +309,7 @@ void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
     *t_build=cf_now()-tb0;
 
     double tf0=cf_now();
-    fold_cc(rh, out_ccpop, out_ndiff, out_nlen, out_Ne, out_loglik, out_etp, out_ecp, &Gr);
+    fold_cc(rh, out_ccpop, out_start, out_ndiff, out_nlen, out_Ne, out_loglik, out_etp, out_ecp, &Gr);
     *t_fold=cf_now()-tf0;
 
     free_groups(&Gr); free(donors); free(rh);

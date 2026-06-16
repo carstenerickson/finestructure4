@@ -67,7 +67,14 @@ for ds in win200 win800 win win20k; do
   ph="$D/$ds.phase"; rc="$D/$ds.recom"
   [ -f "$ph" ] && [ -f "$rc" ] || continue
   echo "=== dataset $ds ($(sed -n 2p "$ph") SNPs) ==="
-  for mode in "-i 0" "-i 6 -in -iM"; do
+  # The fold drives the full per-pop E-M loop exactly: -ip (copy proportions, from
+  # the per-pop posterior chunk count + start term) and -im (per-pop mutation, from
+  # the per-pop expected differences), alongside -in (N_e) and -iM (global mutation),
+  # so .prop and every other file tracks the dense exactly. (-im uses -i 6, not -i 10:
+  # on the tiny down-sampled win20k the per-pop mutation over-iterates past a valid
+  # rate by -i 10 in ALL THREE backends identically - a property of the data, not the
+  # fold - which the byte-identity check still passes but is not a meaningful config.)
+  for mode in "-i 0" "-i 6 -in -iM" "-i 10 -ip" "-i 10 -ip -in -iM" "-i 6 -im" "-i 6 -ip -im -in"; do
     run "CPLOG=1"  "$ph" "$rc" "$mode" "$TMP/log"
     run ""         "$ph" "$rc" "$mode" "$TMP/lin"
     run ""         "$ph" "$rc" "$mode -fold" "$TMP/fold"
