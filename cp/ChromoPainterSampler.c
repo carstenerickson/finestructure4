@@ -563,7 +563,8 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
   if(Par->vverbose) fprintf(Par->out,"        sampler: forwards algorithm\n");
       /* FORWARDS ALGORITHM: (Rabiner 1989, p.262) */
   char *cpfold_env = getenv("CPFOLD");
-  int use_lin = getenv("CPLINEAR") != NULL;   /* linear-space O(N)-transcendental dense */
+  int use_lin = (getenv("CPLOG") == NULL);   /* linear-space dense is the DEFAULT (PR1);
+                                                CPLOG=1 forces the old log-space path for A/B validation */
   double *Asvec = (use_lin && !Par->use_fold) ? malloc((*p_Nloci)*sizeof(double)) : NULL;
   double t_dense0 = cpfold_env ? omp_get_wtime() : 0.0;
   int finalrun= (run_num == (Par->EMruns-1));
