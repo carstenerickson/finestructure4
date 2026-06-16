@@ -8,7 +8,9 @@
    build (*t_build) and the per-recipient fold (*t_fold) separately. */
 void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
                    double *TransProb, double *MutProb_vec, double *copy_prob,
+                   double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
-                   double *out_ccpop, double *t_build, double *t_fold);
+                   double *out_ccpop, double *out_ndiff, double *out_Ne,
+                   double *t_build, double *t_fold);
 
 #endif

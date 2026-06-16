@@ -571,23 +571,28 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
 
   if(Par->use_fold){
     /* -fold: replace the O(N*K) dense FB with the exact O(N*Umean) block fold.
-       Produces per-pop chunk counts (the coancestry); the per-pop total is exact,
-       distributed uniformly within each donor pop so total_counts is reproduced.
-       Chunk-counts only: lengths/differences/regional are zeroed (deterministic
-       -i 0 mode; uniform copy_prob + global mutation assumed). */
-    double *fpp=calloc(ndonorpops,sizeof(double)); int *cntp=calloc(ndonorpops,sizeof(int));
+       Produces per-pop chunk counts (coancestry), per-pop expected_differences
+       (for the -iM global-mutation EM update) and N_e_new (for the -in N_e EM
+       update), so -fold drives the full -i N -in -iM EM loop. Per-pop totals are
+       exact, distributed uniformly within each donor pop so total_counts /
+       total_differences are reproduced. (chunk-LENGTH + regional outputs are not
+       produced; uniform copy_prob + global mutation assumed - guarded at parse.) */
+    double *fpp=calloc(ndonorpops,sizeof(double)), *fdiff=calloc(ndonorpops,sizeof(double));
+    int *cntp=calloc(ndonorpops,sizeof(int));
     for(i=0;i<*p_Nhaps;i++) cntp[pop_vec[i]]++;
     double tb=0,tf=0;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
-                  copy_prob, pop_vec, ndonorpops, Par->fold_ustar, fpp, &tb, &tf);
+                  copy_prob, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops,
+                  Par->fold_ustar, fpp, fdiff, &N_e_new, &tb, &tf);
     for(i=0;i<*p_Nhaps;i++){ int p=pop_vec[i];
       corrected_chunk_count[i]=(cntp[p]>0)?fpp[p]/cntp[p]:0.0;
-      expected_chunk_length[i]=0.0; expected_differences[i]=0.0;
+      expected_differences[i]=(cntp[p]>0)?fdiff[p]/cntp[p]:0.0;
+      expected_chunk_length[i]=0.0;
       copy_prob_new[i]=copy_prob[i]; copy_prob_newSTART[i]=copy_probSTART[i]; }
     for(i=0;i<ndonorpops;i++){ regional_chunk_count_sum_final[i]=0.0; regional_chunk_count_sum_squared_final[i]=0.0; snp_info_measure[i]=0.0; }
-    num_regions=0; N_e_new=p_rhobar;
-    if(cpfold_env) fprintf(Par->out,"[CPFOLD-prod] N=%d K=%d Ustar=%d  fold=%.2f ms (+grouping %.2f ms)\n",*p_Nloci,*p_Nhaps,Par->fold_ustar,tf*1e3,tb*1e3);
-    free(fpp); free(cntp);
+    num_regions=0;
+    if(cpfold_env) fprintf(Par->out,"[CPFOLD-prod] N=%d K=%d Ustar=%d N_e=%.2f  fold=%.2f ms (+grouping %.2f ms)\n",*p_Nloci,*p_Nhaps,Par->fold_ustar,N_e_new,tf*1e3,tb*1e3);
+    free(fpp); free(fdiff); free(cntp);
   } else {
     Alphasum = use_lin
       ? forwardAlgorithmLin(newh, existing_h, Alphamat, Asvec, MutProb_vec, p_Nhaps,p_Nloci,copy_prob, copy_probSTART, TransProb,Par)
@@ -609,20 +614,24 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
   if(cpfold_env && !Par->use_fold && finalrun){
     double t_dense = omp_get_wtime() - t_dense0;
     int Ustar = getenv("CPFOLD_USTAR") ? atoi(getenv("CPFOLD_USTAR")) : 24;
-    double *ccfold = malloc(ndonorpops*sizeof(double));
-    double *ccdense = calloc(ndonorpops, sizeof(double));
-    for (i=0; i < *p_Nhaps; i++) ccdense[pop_vec[i]] += corrected_chunk_count[i];
-    double t_build=0, t_fold=0;
+    double *ccfold = malloc(ndonorpops*sizeof(double)), *cdfold = malloc(ndonorpops*sizeof(double));
+    double *ccdense = calloc(ndonorpops, sizeof(double)), *cddense = calloc(ndonorpops, sizeof(double));
+    for (i=0; i < *p_Nhaps; i++){ ccdense[pop_vec[i]] += corrected_chunk_count[i]; cddense[pop_vec[i]] += expected_differences[i]; }
+    double t_build=0, t_fold=0, Ne_fold=0;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
-                  copy_prob, pop_vec, ndonorpops, Ustar, ccfold, &t_build, &t_fold);
-    double mre=0; for(int p=0;p<ndonorpops;p++){ double e=fabs(ccfold[p]-ccdense[p])/(fabs(ccdense[p])+1e-300); if(e>mre)mre=e; }
+                  copy_prob, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops, Ustar,
+                  ccfold, cdfold, &Ne_fold, &t_build, &t_fold);
+    double mre=0,mrd=0; for(int p=0;p<ndonorpops;p++){
+      double e=fabs(ccfold[p]-ccdense[p])/(fabs(ccdense[p])+1e-300); if(e>mre)mre=e;
+      double d=fabs(cdfold[p]-cddense[p])/(fabs(cddense[p])+1e-300); if(d>mrd)mrd=d; }
+    double Ne_rel=fabs(Ne_fold-N_e_new)/(fabs(N_e_new)+1e-300);
     fprintf(Par->out,"[CPFOLD] N=%d K=%d npop=%d Ustar=%d threads=%d\n",*p_Nloci,*p_Nhaps,ndonorpops,Ustar,omp_get_max_threads());
-    fprintf(Par->out,"[CPFOLD] dense per-pop:"); for(int p=0;p<ndonorpops;p++) fprintf(Par->out," %.6f",ccdense[p]); fprintf(Par->out,"\n");
-    fprintf(Par->out,"[CPFOLD] fold  per-pop:"); for(int p=0;p<ndonorpops;p++) fprintf(Par->out," %.6f",ccfold[p]); fprintf(Par->out,"\n");
-    fprintf(Par->out,"[CPFOLD] fold-vs-dense max rel err = %.3e\n",mre);
+    fprintf(Par->out,"[CPFOLD] chunkcount fold-vs-dense max rel err = %.3e\n",mre);
+    fprintf(Par->out,"[CPFOLD] differences fold-vs-dense max rel err = %.3e\n",mrd);
+    fprintf(Par->out,"[CPFOLD] N_e fold=%.4f dense=%.4f rel err = %.3e\n",Ne_fold,N_e_new,Ne_rel);
     fprintf(Par->out,"[CPFOLD] WALL: dense FB=%.2f ms  fold=%.2f ms (+ grouping %.2f ms)  speedup fold-only=%.2fx  incl-grouping=%.2fx\n",
             t_dense*1e3, t_fold*1e3, t_build*1e3, t_dense/t_fold, t_dense/(t_fold+t_build));
-    free(ccfold); free(ccdense);
+    free(ccfold); free(ccdense); free(cdfold); free(cddense);
   }
 
   ////////////////////////////////

@@ -475,14 +475,18 @@ void printInformation(struct files_t *Outfiles,struct infiles_t *Infiles,struct 
   if (Par->use_fold==1)
     {
       if (Par->fold_ustar < 2) Par->fold_ustar = 24;
-      if (Par->prior_donor_probs_ind || Par->mutation_rate_ind || Par->EMruns>0 ||
-          Par->copy_prop_em_find || Par->recom_em_find || Par->mutation_em_find ||
-          Par->mutationALL_em_find || Par->samplesTOT>0 || Par->unlinked_ind)
+      /* -fold supports the E-M loop with -in (N_e) and -iM (GLOBAL mutation) - the
+         quantities it folds exactly. It assumes UNIFORM copy probabilities and a
+         single GLOBAL mutation rate throughout, so it is incompatible with the
+         modes that make those per-donor/per-pop or that need the Alphamat. */
+      if (Par->prior_donor_probs_ind || Par->mutation_rate_ind ||
+          Par->copy_prop_em_find || Par->mutation_em_find ||
+          Par->samplesTOT>0 || Par->unlinked_ind)
         {
-          fprintf(Par->out,"ERROR: -fold (exact block-fold) computes CHUNK COUNTS ONLY, under uniform copy probabilities and a single global mutation rate, with no E-M and no sampling. It is incompatible with -p, -m, -u, -s >0 and -i >0 (E-M). Re-run with -i 0 -s 0 and without -p/-m/-u. Exiting...\n");
+          fprintf(Par->out,"ERROR: -fold (exact block-fold) assumes uniform copy probabilities and a single global mutation rate, and produces chunk counts only (no samples). It supports E-M with -in (N_e) and -iM (global mutation), but is incompatible with -p (prior donor probs), -m (fixed per-pop mutation), -ip (copy-proportion E-M), -im (per-pop mutation E-M), -u (unlinked) and -s >0 (sampling). Exiting...\n");
           stop_on_error(1,Par->errormode,Par->err);
         }
-      fprintf(Par->out,"Using exact block-fold (-fold, Ustar=%d): chunk counts only; chunk-length and mutation-prob outputs are NOT produced.\n",Par->fold_ustar);
+      fprintf(Par->out,"Using exact block-fold (-fold, Ustar=%d): chunk counts + N_e/-iM E-M; chunk-length and region outputs are NOT produced.\n",Par->fold_ustar);
     }
   if (Par->copy_prop_em_find==1)
     fprintf(Par->out,"Running E-M to estimate copying proportions....\n");
