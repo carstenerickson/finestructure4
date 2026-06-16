@@ -80,7 +80,10 @@ static Groups build_groups_adaptive(int Ustar){
     Groups G; G.B=Ustar; G.nb=0;
     int cap_blk=64; G.blk=malloc(sizeof(Block)*cap_blk); int *gidB=NULL;
     int *gid=malloc(sizeof(int)*K), *ng=malloc(sizeof(int)*K);
-    int mapsz=(Ustar+16)*16; if(mapsz<512) mapsz=512;
+    /* map indexed by ek=gid[i]*16+code; gid[i] < K always (<= K groups), and the
+       transient group count between block-start cuts can exceed Ustar on
+       multi-allelic data, so size by K (not Ustar) to be overflow-proof. */
+    int mapsz=K*16+16;
     int *mp=malloc(sizeof(int)*mapsz), *mstamp=calloc(mapsz,sizeof(int)); int gen=0, Umax=0;
     int a=0; for(int i=0;i<K;i++) gid[i]=0; int U=1; int b=0;
     while(b<N){

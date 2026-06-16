@@ -170,8 +170,13 @@ void assignParameters(struct param_t *Par,struct infiles_t *Infiles,struct files
 	 Par->unlinked_ind=1;
        if (strcmp(argv[i],"-fold")==0)
 	 Par->use_fold=1;
-       if (strcmp(argv[i],"-foldU")==0)
+       if (strcmp(argv[i],"-foldU")==0) {
+	 if (i+1>=argc || argv[i+1][0]=='-') {
+	   fprintf(Par->out,"-foldU requires a positive integer argument. Exiting...\n");
+	   stop_on_error(1,Par->errormode,Par->err);
+	 }
 	 Par->fold_ustar=atoi(argv[i+1]);
+       }
        if (strcmp(argv[i],"-p")==0)
 	 Par->prior_donor_probs_ind=1;
        if (strcmp(argv[i],"-b")==0) {
@@ -467,6 +472,18 @@ void printInformation(struct files_t *Outfiles,struct infiles_t *Infiles,struct 
     fprintf(Par->out,"Using specified prior donor probs from input file....\n");
   if ((Par->mutation_rate_ind==1) && (Par->mutationALL_em_find==0))
     fprintf(Par->out,"Using specified mutation rates from input file....\n");
+  if (Par->use_fold==1)
+    {
+      if (Par->fold_ustar < 2) Par->fold_ustar = 24;
+      if (Par->prior_donor_probs_ind || Par->mutation_rate_ind || Par->EMruns>0 ||
+          Par->copy_prop_em_find || Par->recom_em_find || Par->mutation_em_find ||
+          Par->mutationALL_em_find || Par->samplesTOT>0 || Par->unlinked_ind)
+        {
+          fprintf(Par->out,"ERROR: -fold (exact block-fold) computes CHUNK COUNTS ONLY, under uniform copy probabilities and a single global mutation rate, with no E-M and no sampling. It is incompatible with -p, -m, -u, -s >0 and -i >0 (E-M). Re-run with -i 0 -s 0 and without -p/-m/-u. Exiting...\n");
+          stop_on_error(1,Par->errormode,Par->err);
+        }
+      fprintf(Par->out,"Using exact block-fold (-fold, Ustar=%d): chunk counts only; chunk-length and mutation-prob outputs are NOT produced.\n",Par->fold_ustar);
+    }
   if (Par->copy_prop_em_find==1)
     fprintf(Par->out,"Running E-M to estimate copying proportions....\n");
   if (Par->recom_em_find==1)
