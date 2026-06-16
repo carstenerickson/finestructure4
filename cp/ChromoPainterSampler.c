@@ -1,5 +1,7 @@
 #include "ChromoPainterSampler.h"
+#include "ChromoPainterFold.h"
 #include <omp.h>
+#include <stdlib.h>
 
 #include <time.h>
 
@@ -421,6 +423,8 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
 
   if(Par->vverbose) fprintf(Par->out,"        sampler: forwards algorithm\n");
       /* FORWARDS ALGORITHM: (Rabiner 1989, p.262) */
+  char *cpfold_env = getenv("CPFOLD");
+  double t_dense0 = cpfold_env ? omp_get_wtime() : 0.0;
   double Alphasum = forwardAlgorithm(newh, existing_h, Alphamat, MutProb_vec, p_Nhaps,p_Nloci,copy_prob, copy_probSTART, TransProb,Par);
 
   if(Outfiles->usingFile[2]) fprintf(Outfiles->fout3," %.10lf",Alphasum);
@@ -429,6 +433,28 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
   int finalrun= (run_num == (Par->EMruns-1));
   if(run_num <= (Par->EMruns-1)){
     backwardAlgorithm(finalrun,ndonorpops,ind_val,Alphasum,p_rhobar,&N_e_new,newh,existing_h,Alphamat,lambda,delta,MutProb_vec,p_Nhaps,p_Nloci,copy_prob,copy_prob_new,copy_prob_newSTART, corrected_chunk_count, expected_chunk_length, expected_differences,regional_chunk_count_sum_final,regional_chunk_count_sum_squared_final, &num_regions, copy_probSTART, TransProb, pop_vec,pos,snp_info_measure,Outfiles,Par);
+  }
+
+  /* ---- CPFOLD benchmark: exact block-fold of the chunk counts (env CPFOLD=1) ----
+     Runs the O(N*Umean) fold on the SAME data + TransProb the dense just used,
+     compares per-pop chunk counts, and reports dense-FB vs fold wall-clock. */
+  if(cpfold_env && finalrun){
+    double t_dense = omp_get_wtime() - t_dense0;
+    int Ustar = getenv("CPFOLD_USTAR") ? atoi(getenv("CPFOLD_USTAR")) : 24;
+    double *ccfold = malloc(ndonorpops*sizeof(double));
+    double *ccdense = calloc(ndonorpops, sizeof(double));
+    for (i=0; i < *p_Nhaps; i++) ccdense[pop_vec[i]] += corrected_chunk_count[i];
+    double t_build=0, t_fold=0;
+    cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
+                  copy_prob, pop_vec, ndonorpops, Ustar, ccfold, &t_build, &t_fold);
+    double mre=0; for(int p=0;p<ndonorpops;p++){ double e=fabs(ccfold[p]-ccdense[p])/(fabs(ccdense[p])+1e-300); if(e>mre)mre=e; }
+    fprintf(Par->out,"[CPFOLD] N=%d K=%d npop=%d Ustar=%d threads=%d\n",*p_Nloci,*p_Nhaps,ndonorpops,Ustar,omp_get_max_threads());
+    fprintf(Par->out,"[CPFOLD] dense per-pop:"); for(int p=0;p<ndonorpops;p++) fprintf(Par->out," %.6f",ccdense[p]); fprintf(Par->out,"\n");
+    fprintf(Par->out,"[CPFOLD] fold  per-pop:"); for(int p=0;p<ndonorpops;p++) fprintf(Par->out," %.6f",ccfold[p]); fprintf(Par->out,"\n");
+    fprintf(Par->out,"[CPFOLD] fold-vs-dense max rel err = %.3e\n",mre);
+    fprintf(Par->out,"[CPFOLD] WALL: dense FB=%.2f ms  fold=%.2f ms (+ grouping %.2f ms)  speedup fold-only=%.2fx  incl-grouping=%.2fx\n",
+            t_dense*1e3, t_fold*1e3, t_build*1e3, t_dense/t_fold, t_dense/(t_fold+t_build));
+    free(ccfold); free(ccdense);
   }
 
   //////////////////////////////// 
