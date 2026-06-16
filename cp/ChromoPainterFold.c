@@ -118,7 +118,7 @@ static Groups build_groups_adaptive(int Ustar){
 
 /* FOLDED forward+backward+chunkcount -> per-pop chunk counts (ccpop[npop]).
    Direct port of cpfold.c fold_cc; rh = the recipient allele row. */
-static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *Ne_out, Groups *Gr){
+static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nlen, double *Ne_out, Groups *Gr){
     #define EM(L,II) emis(rh[(L)], donors[(size_t)(L)*K+(II)])
     int nb=Gr->nb, Umax=Gr->Umax; Block *blk=Gr->blk; int *gidB=Gr->gidB;
     int *sizeg=Gr->sizeg, *repg=Gr->repg;
@@ -170,7 +170,7 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *Ne_
        N_e from per-locus etp (the chunkcount total) rho-weighted by the dense gd_l;
        per-pop expected_differences from e_a_l_bc=a_l*c_l*KC folded over the moments. */
     double tot_prob_Ne=0.0, tot_gd=0.0;
-    for(int p=0;p<npop;p++) ndiff[p]=0.0;
+    for(int p=0;p<npop;p++){ ndiff[p]=0.0; nlen[p]=0.0; }
     { double S_end=exp(As[N-2]-Asf);   /* last locus N-1: c=1, a[N-1]=aprev (post-forward) */
       for(int i=0;i<K;i++) if(rh[N-1]!=donors[(size_t)(N-1)*K+i]) ndiff[pop_vec[i]]+=aprev[i]*S_end; }
     double *cexit=malloc(sizeof(double)*K); for(int i=0;i<K;i++) cexit[i]=1.0;
@@ -196,6 +196,9 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *Ne_
             double KF1=exp(As[l]+BsR-Asf), KF=exp(Asm1+BsR-Asf), om=(1-T[l]);
             double *GFr=GFb+(size_t)(l-sb)*U, *PFr=PFb+(size_t)(l-sb)*U;
             double etpl=0.0;     /* per-locus chunkcount total = expected_transition_prob[l] (for N_e) */
+            /* expected_chunk_length integrand = G_l*0.5*(e_a_lp1_bp + e_a_l_bc) (the
+               tp_from_i_to_i terms cancel); G_l = 100*(pos[l+1]-pos[l])*delta*lambda[l] (cM). */
+            double Glh = (lam_g[l]>=0) ? 0.5*100.0*(pos_g[l+1]-pos_g[l])*delta_g*lam_g[l] : 0.0;
             if(l < eb-1){
                 double *GFr1=GFb+(size_t)(l+1-sb)*U, *PFr1=PFb+(size_t)(l+1-sb)*U;
                 for(int g=0;g<U;g++){
@@ -203,9 +206,11 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *Ne_
                     double XG=GFr1[g]*KF1 - GFr[g]*KF*eg*om, XP=PFr1[g]*KF1 - PFr[g]*KF*eg*om;
                     double GBl1,PBl1; if(l+1==N-1){GBl1=1.0;PBl1=0.0;} else {GBl1=GBp[g];PBl1=PBp[g];}
                     double cA=GBl1*XG, cB=GBl1*XP, cC=PBl1*XG, cD=PBl1*XP; int base=g*npop;
+                    double aA=KF1*GFr1[g]*GBl1, aB=KF1*GFr1[g]*PBl1, aC=KF1*PFr1[g]*GBl1, aD=KF1*PFr1[g]*PBl1; /* e_a_lp1_bp */
                     for(int p=0;p<npop;p++){ double s_=szP[base+p]; if(s_==0.0) continue;
                         double inc=cA*s_ + cB*SaP[base+p] + cC*SwP[base+p] + cD*SawP[base+p];
-                        ccpop[p]+=inc; etpl+=inc; }
+                        ccpop[p]+=inc; etpl+=inc;
+                        nlen[p]+=Glh*(aA*s_ + aB*SwP[base+p] + aC*SaP[base+p] + aD*SawP[base+p]); }
                 }
             } else if(b+1<nb){
                 int co=Gr->celloff[b], nc=Gr->celloff[b+1]-co; int *cidB=Gr->cellB+(size_t)b*K;
@@ -218,17 +223,24 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *Ne_
                 for(int c=0;c<nc;c++){ int g=cGb[c], g2=cG2[c];
                     double C0=KF1*GF2[g2], C1=KF1*PF2[g2]-KF*om*Eg2[g2];
                     double cf0=C0+C1*GFr[g], cf1=C1*PFr[g]; int base=c*npop;
-                    for(int p=0;p<npop;p++){ double inc=cf0*Mc[base+p]+cf1*Mce[base+p]; ccpop[p]+=inc; etpl+=inc; } }
+                    /* e_a_lp1_bp at boundary: a_{eb}=GF2+PF2*a_l, a_l=GFr+PFr*ent, so
+                       a_{eb}*cx2 summed = (GF2+PF2*GFr)*Mc + PF2*PFr*Mce, times KF1. */
+                    double bA=KF1*(GF2[g2]+PF2[g2]*GFr[g]), bB=KF1*PF2[g2]*PFr[g];
+                    for(int p=0;p<npop;p++){ double inc=cf0*Mc[base+p]+cf1*Mce[base+p]; ccpop[p]+=inc; etpl+=inc;
+                        nlen[p]+=Glh*(bA*Mc[base+p]+bB*Mce[base+p]); } }
             }
             /* N_e: dense gd_l rho-weight (pos/delta/lambda - NOT the T-form, which underflows) */
             if(lam_g[l]>=0){ double gd=(pos_g[l+1]-pos_g[l])*delta_g*lam_g[l];
                 tot_gd+=gd; tot_prob_Ne+=(rho_g*gd/(1.0-exp(-rho_g*gd)))*etpl; }
-            /* per-pop expected_differences: e_a_l_bc=a_l*c_l*KC, CURRENT GBc/PBc, group-constant mismatch */
+            /* per-pop expected_differences (e_a_l_bc=a_l*c_l*KC, mismatched donors) +
+               the e_a_l_bc half of expected_chunk_length (all donors). CURRENT GBc/PBc. */
             { double KC=exp(Asm1+Bs[l+1]-Asf); int *rp=repg+(size_t)b*Umax;
-              for(int g=0;g<U;g++){ if(rh[l]==donors[(size_t)l*K+rp[g]]) continue;  /* mm_g==0 */
+              for(int g=0;g<U;g++){
                 double gA=GFr[g],pA=PFr[g],gB=GBc[g],pB=PBc[g]; int base=g*npop;
+                int mm = (rh[l]!=donors[(size_t)l*K+rp[g]]);
                 for(int p=0;p<npop;p++){ double sz_=szP[base+p];
-                    ndiff[p]+=KC*(gA*gB*sz_ + gA*pB*SwP[base+p] + pA*gB*SaP[base+p] + pA*pB*SawP[base+p]); } } }
+                    double albc=KC*(gA*gB*sz_ + gA*pB*SwP[base+p] + pA*gB*SaP[base+p] + pA*pB*SawP[base+p]);
+                    nlen[p]+=Glh*albc; if(mm) ndiff[p]+=albc; } } }
             { double *t; t=GBp;GBp=GBc;GBc=t; t=PBp;PBp=PBc;PBc=t; }
         }
         double *cxb=CEXIT+(size_t)b*K;
@@ -253,7 +265,7 @@ void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
                    double *TransProb, double *MutProb_vec, double *copy_prob,
                    double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
-                   double *out_ccpop, double *out_ndiff, double *out_Ne,
+                   double *out_ccpop, double *out_ndiff, double *out_nlen, double *out_Ne,
                    double *t_build, double *t_fold){
     K=nhaps; N=nloci; npop=ndonorpops;
     copyprob=copy_prob[0]; mut=MutProb_vec[0];
@@ -269,7 +281,7 @@ void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
     *t_build=cf_now()-tb0;
 
     double tf0=cf_now();
-    fold_cc(rh, out_ccpop, out_ndiff, out_Ne, &Gr);
+    fold_cc(rh, out_ccpop, out_ndiff, out_nlen, out_Ne, &Gr);
     *t_fold=cf_now()-tf0;
 
     free_groups(&Gr); free(donors); free(rh);

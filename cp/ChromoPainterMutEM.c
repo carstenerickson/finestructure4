@@ -486,7 +486,7 @@ void printInformation(struct files_t *Outfiles,struct infiles_t *Infiles,struct 
           fprintf(Par->out,"ERROR: -fold (exact block-fold) assumes uniform copy probabilities and a single global mutation rate, and produces chunk counts only (no samples). It supports E-M with -in (N_e) and -iM (global mutation), but is incompatible with -p (prior donor probs), -m (fixed per-pop mutation), -ip (copy-proportion E-M), -im (per-pop mutation E-M), -u (unlinked) and -s >0 (sampling). Exiting...\n");
           stop_on_error(1,Par->errormode,Par->err);
         }
-      fprintf(Par->out,"Using exact block-fold (-fold, Ustar=%d): chunk counts + N_e/-iM E-M; chunk-length and region outputs are NOT produced.\n",Par->fold_ustar);
+      fprintf(Par->out,"Using exact block-fold (-fold, Ustar=%d): chunk counts, chunk lengths, mutation probs + N_e/-iM E-M (all exact); regional bootstrap outputs are NOT produced.\n",Par->fold_ustar);
     }
   if (Par->copy_prop_em_find==1)
     fprintf(Par->out,"Running E-M to estimate copying proportions....\n");
