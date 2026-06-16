@@ -5,9 +5,12 @@
  * per-population corrected_chunk_count IDENTICALLY to the dense forward-
  * backward-chunkcount, in O(N*Umean) instead of O(N*K).
  *
- * Scope: chunk counts only (the coancestry matrix). Requires the deterministic
- * fixed-parameter mode: uniform copy_prob, uniform (global) mutation rate, no
- * EM (-i 0). Reuses the caller's exact TransProb so the transition is identical.
+ * Produces per-population chunk counts, expected differences, expected chunk
+ * lengths, the N_e (-in) and global-mutation (-iM) E-M quantities, and the forward
+ * log-likelihood. Exact for uniform copy_prob + global mutation and for FIXED
+ * per-population copy_prob (-p) / mutation (-m); does not run per-pop E-M updates
+ * (-ip/-im) or sampling (-s>0). Reuses the caller's exact TransProb so the
+ * transition is identical to the dense.
  *
  * cpfold_perpop() is the entry point called from sampler() under -fold.
  */
@@ -18,8 +21,6 @@
 #include <stdint.h>
 #include <time.h>
 #include "ChromoPainterFold.h"
-
-#define CF_SMALL_NUM 1e-20
 
 /* engine globals (set per call by cpfold_perpop; single-threaded engine) */
 static int K, N, npop;
@@ -35,13 +36,7 @@ static double *pos_g, *lam_g, delta_g, rho_g;  /* for the N_e (-in) EM update */
 
 static double cf_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec + t.tv_nsec*1e-9; }
 
-/* emission e(recipient allele r, donor allele d, donor mutation m):
-   r==9 -> 1.0 (recipient missing ignored); r==8 -> gap (SMALL_NUM); else (1-m)/m. */
-static inline double emis(int r, int d, double m){
-    if(r==9) return 1.0;
-    if(r==8) return (r==d)?(1-CF_SMALL_NUM):CF_SMALL_NUM;
-    return (r==d)?(1-m):m;
-}
+/* emission is cp_emis() from ChromoPainterFold.h - shared with the dense FB. */
 
 typedef struct { int s,e,U; } Block;
 typedef struct {
@@ -124,8 +119,8 @@ static Groups build_groups_adaptive(int Ustar, int bypop){
 
 /* FOLDED forward+backward+chunkcount -> per-pop chunk counts (ccpop[npop]).
    Direct port of cpfold.c fold_cc; rh = the recipient allele row. */
-static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nlen, double *Ne_out, Groups *Gr){
-    #define EM(L,II) emis(rh[(L)], donors[(size_t)(L)*K+(II)], cf_mut[(II)])
+static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nlen, double *Ne_out, double *loglik_out, Groups *Gr){
+    #define EM(L,II) cp_emis(rh[(L)], donors[(size_t)(L)*K+(II)], cf_mut[(II)])
     int nb=Gr->nb, Umax=Gr->Umax; Block *blk=Gr->blk; int *gidB=Gr->gidB;
     int *sizeg=Gr->sizeg, *repg=Gr->repg;
     /* per-(block,group) copy_prob / copy_probSTART (group-constant since each group
@@ -240,9 +235,12 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
                     for(int p=0;p<npop;p++){ double inc=cf0*Mc[base+p]+cf1*Mce[base+p]; ccpop[p]+=inc; etpl+=inc;
                         nlen[p]+=Glh*(bA*Mc[base+p]+bB*Mce[base+p]); } }
             }
-            /* N_e: dense gd_l rho-weight (pos/delta/lambda - NOT the T-form, which underflows) */
+            /* N_e: dense gd_l rho-weight (pos/delta/lambda - NOT the T-form, which underflows).
+               Skip zero-distance loci (gd==0, e.g. duplicate SNP position or lambda==0):
+               their rho-weight is the 0/0 limit 1 but etpl->0 there, so the contribution is
+               zero - including them would divide by zero. Matches the dense guard. */
             if(lam_g[l]>=0){ double gd=(pos_g[l+1]-pos_g[l])*delta_g*lam_g[l];
-                tot_gd+=gd; tot_prob_Ne+=(rho_g*gd/(1.0-exp(-rho_g*gd)))*etpl; }
+                if(gd>0.0){ tot_gd+=gd; tot_prob_Ne+=(rho_g*gd/(1.0-exp(-rho_g*gd)))*etpl; } }
             /* per-pop expected_differences (e_a_l_bc=a_l*c_l*KC, mismatched donors) +
                the e_a_l_bc half of expected_chunk_length (all donors). CURRENT GBc/PBc. */
             { double KC=exp(Asm1+Bs[l+1]-Asf); int *rp=repg+(size_t)b*Umax;
@@ -261,7 +259,8 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
       for(int i=0;i<K;i++){ int g=gb0[i]; double a0=GF0[g]+PF0[g]*ent0[i]; ccpop[pop_vec[i]] += a0*cx0[i]*k0; } }
 
     *Ne_out = (tot_gd>0.0) ? tot_prob_Ne/tot_gd : 0.0;   /* N_e EM estimate (-in); dense floor */
-    if(*Ne_out < 1e-8) *Ne_out = 1e-8;
+    if(*Ne_out < MIN_NE) *Ne_out = MIN_NE;
+    if(loglik_out) *loglik_out = Asf;   /* forward log-likelihood (= dense Alphasum) */
 
     free(off);free(GF);free(PF);free(Eg);free(AENTRY);free(WB);free(CEXIT);free(As);free(Bs);
     free(SentS);free(SwS);free(G);free(P);free(GBp);free(PBp);free(GBc);free(PBc);
@@ -277,7 +276,7 @@ void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
                    double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
                    double *out_ccpop, double *out_ndiff, double *out_nlen, double *out_Ne,
-                   double *t_build, double *t_fold){
+                   double *out_loglik, double *t_build, double *t_fold){
     K=nhaps; N=nloci; npop=ndonorpops;
     cf_cp=copy_prob; cf_cps=copy_probSTART; cf_mut=MutProb_vec;
     pop_vec=pop_vec_in; T=TransProb;
@@ -296,7 +295,7 @@ void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
     *t_build=cf_now()-tb0;
 
     double tf0=cf_now();
-    fold_cc(rh, out_ccpop, out_ndiff, out_nlen, out_Ne, &Gr);
+    fold_cc(rh, out_ccpop, out_ndiff, out_nlen, out_Ne, out_loglik, &Gr);
     *t_fold=cf_now()-tf0;
 
     free_groups(&Gr); free(donors); free(rh);

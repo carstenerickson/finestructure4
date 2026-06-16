@@ -6,16 +6,7 @@
 #include <time.h>
 
 #define MIN_THETA 1e-8
-#define MIN_NE 1e-8
-#define SMALL_NUM 1e-20
-
-/* emission e(recipient allele r, donor allele d, donor mut m) - matches the
-   inline emission in forwardAlgorithm/backwardAlgorithm exactly. */
-static inline double cp_emis(int r, int d, double m){
-  if(r==9) return 1.0;
-  if(r==8) return (r==d)?(1-SMALL_NUM):SMALL_NUM;
-  return (r==d)?(1-m):m;
-}
+/* SMALL_NUM, MIN_NE and cp_emis() are shared with the fold in ChromoPainterFold.h. */
 
 ///////////////////////////////////////
 ///////////////////////////////////////
@@ -345,11 +336,18 @@ void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,
   total_gen_dist=0.0;
   for (locus = 0; locus < (*p_Nloci-1); locus++)
     {
-      if (Par->unlinked_ind==0 && lambda[locus] >= 0) total_gen_dist=total_gen_dist+(pos[(locus+1)]-pos[locus])*delta*lambda[locus];
-      if (Par->unlinked_ind==0 && lambda[locus] >= 0) total_prob=total_prob+((p_rhobar*(pos[(locus+1)]-pos[locus])*delta*lambda[locus])/(1.0-exp(-1.0*p_rhobar*(pos[(locus+1)]-pos[locus])*delta*lambda[locus])))*expected_transition_prob[locus];
+      if (Par->unlinked_ind==0 && lambda[locus] >= 0) {
+        double gd=(pos[(locus+1)]-pos[locus])*delta*lambda[locus];
+        /* skip zero-distance loci (gd==0): the rho-weight is the 0/0 limit but the
+           transition prob ->0 there, so they contribute zero; including them NaNs N_e. */
+        if(gd>0.0){
+          total_gen_dist=total_gen_dist+gd;
+          total_prob=total_prob+((p_rhobar*gd)/(1.0-exp(-1.0*p_rhobar*gd)))*expected_transition_prob[locus];
+        }
+      }
     }
   if (Par->unlinked_ind==0){
-    *N_e_new = total_prob/total_gen_dist;
+    *N_e_new = (total_gen_dist>0.0) ? total_prob/total_gen_dist : 0.0;   /* guard all-zero-distance */
     if(*N_e_new<MIN_NE) *N_e_new=MIN_NE;
   }
   if (Par->unlinked_ind==1) *N_e_new = 0.0;
@@ -408,6 +406,7 @@ void backwardAlgorithmLin(int finalrun,int ndonorpops,int ind_val,double Alphasu
   double Asf=Asvec[Nl-1];                 // = Alphasum (cumulative forward log-normalizer)
   double *cprev=malloc(Nh*sizeof(double));   // c[locus+1][i] (linear)
   double *ccur =malloc(Nh*sizeof(double));   // c[locus][i]   (linear)
+  double *ep1buf=malloc(Nh*sizeof(double));  // emission e(newh[locus+1],donor) reused this iter
   double *Bs   =malloc(Nl*sizeof(double));   // backward cumulative log-normalizers
   double *exp_copy_pop=malloc(ndonorpops*sizeof(double));
   double *ind_snp_sum_vec=malloc(ndonorpops*sizeof(double));
@@ -439,8 +438,8 @@ void backwardAlgorithmLin(int finalrun,int ndonorpops,int ind_val,double Alphasu
   for(locus=Nl-2; locus>=0; locus--){
     double rb=(locus+2<=Nl-1)?exp(Bs[locus+2]-Bs[locus+1]):exp(-Bs[Nl-1]);
     double om=(1-TransProb[locus]);
-    // c[locus] (linear) + Bs[locus]
-    for(i=0;i<Nh;i++){ double ep1=cp_emis(newh[locus+1],existing_h[i][locus+1],MutProb_vec[i]); ccur[i]=1.0+om*rb*ep1*cprev[i]; }
+    // c[locus] (linear) + Bs[locus]; cache e(newh[locus+1],donor i) for reuse below
+    for(i=0;i<Nh;i++){ double ep1=cp_emis(newh[locus+1],existing_h[i][locus+1],MutProb_vec[i]); ep1buf[i]=ep1; ccur[i]=1.0+om*rb*ep1*cprev[i]; }
     if(locus>0){ double s2=0.0; for(i=0;i<Nh;i++){ double e=cp_emis(newh[locus],existing_h[i][locus],MutProb_vec[i]); s2+=TransProb[locus-1]*copy_prob[i]*e*ccur[i]; } Bs[locus]=Bs[locus+1]+log(s2); }
     double BsR=(locus+2<=Nl-1)?Bs[locus+2]:0.0, Asm1=(locus>=1)?Asvec[locus-1]:0.0;
     double KF1=exp(Asvec[locus]+BsR-Asf), KF=exp(Asm1+BsR-Asf), KC=exp(Asm1+Bs[locus+1]-Asf);
@@ -448,7 +447,7 @@ void backwardAlgorithmLin(int finalrun,int ndonorpops,int ind_val,double Alphasu
     if(finalrun) for(i=0;i<ndonorpops;i++) exp_copy_pop[i]=0.0;
 #pragma omp parallel for reduction(+:total_prob,total_regional_chunk_count) reduction(+:ind_snp_sum_vec[:ndonorpops]) reduction(+:exp_copy_pop[:ndonorpops]) schedule(static)
     for(i=0;i<Nh;i++){
-      double ep1=cp_emis(newh[locus+1],existing_h[i][locus+1],MutProb_vec[i]);
+      double ep1=ep1buf[i];
       double e_a_lp1_bp=Alphamat[locus+1][i]*cprev[i]*KF1;
       double e_a_l_bp  =Alphamat[locus][i]*cprev[i]*KF;
       double e_a_l_bc  =Alphamat[locus][i]*ccur[i]*KC;
@@ -483,16 +482,22 @@ void backwardAlgorithmLin(int finalrun,int ndonorpops,int ind_val,double Alphasu
   double total_prob2=0.0,total_gen_dist=0.0;
   for(locus=0; locus<Nl-1; locus++){
     if(Par->unlinked_ind==0 && lambda[locus]>=0){
-      total_gen_dist+=(pos[locus+1]-pos[locus])*delta*lambda[locus];
-      total_prob2+=((p_rhobar*(pos[locus+1]-pos[locus])*delta*lambda[locus])/(1.0-exp(-1.0*p_rhobar*(pos[locus+1]-pos[locus])*delta*lambda[locus])))*expected_transition_prob[locus];
+      double gd=(pos[locus+1]-pos[locus])*delta*lambda[locus];
+      /* skip zero-distance loci (duplicate SNP position or lambda==0): the rho-weight
+         is the 0/0 limit 1 but the transition prob ->0 there, so the contribution is
+         zero - including them would divide by zero and NaN-poison N_e. */
+      if(gd>0.0){
+        total_gen_dist+=gd;
+        total_prob2+=((p_rhobar*gd)/(1.0-exp(-1.0*p_rhobar*gd)))*expected_transition_prob[locus];
+      }
     }
   }
-  if(Par->unlinked_ind==0){ *N_e_new=total_prob2/total_gen_dist; if(*N_e_new<MIN_NE)*N_e_new=MIN_NE; }
+  if(Par->unlinked_ind==0){ *N_e_new=(total_gen_dist>0.0)?total_prob2/total_gen_dist:0.0; if(*N_e_new<MIN_NE)*N_e_new=MIN_NE; }   /* guard all-zero-distance */
   if(Par->unlinked_ind==1) *N_e_new=0.0;
 
   for(i=0;i<Nh;i++) corrected_chunk_count[i]+=copy_prob_newSTART[i];   // start term
 
-  free(cprev);free(ccur);free(Bs);free(exp_copy_pop);free(ind_snp_sum_vec);
+  free(cprev);free(ccur);free(ep1buf);free(Bs);free(exp_copy_pop);free(ind_snp_sum_vec);
   free(expected_transition_prob);free(regional_chunk_count);free(regional_chunk_count_sum);
 }
 
@@ -563,28 +568,40 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
   if(Par->vverbose) fprintf(Par->out,"        sampler: forwards algorithm\n");
       /* FORWARDS ALGORITHM: (Rabiner 1989, p.262) */
   char *cpfold_env = getenv("CPFOLD");
-  int use_lin = (getenv("CPLOG") == NULL);   /* linear-space dense is the DEFAULT (PR1);
-                                                CPLOG=1 forces the old log-space path for A/B validation */
+  int finalrun= (run_num == (Par->EMruns-1));
+  /* linear-space dense is the DEFAULT (PR1); CPLOG=1 forces the old log-space path
+     for A/B validation. The path-sampling block below reads Alphamat as LOG-space,
+     but forwardAlgorithmLin fills it LINEAR - and sampling inherently needs the
+     log-space matrix, so there is no linear speedup to be had on a run that samples.
+     Only the FINAL run samples (the sampling block is gated on finalrun), so the
+     linear path is still used for every E-M iteration; only the final sampling run
+     (when samplesTOT>0) falls back to the log forward. samplesTOT defaults to 10,
+     so this matters for any default run, not just -s >0. */
+  int use_lin = (getenv("CPLOG") == NULL) && (Par->samplesTOT == 0 || !finalrun);
   double *Asvec = (use_lin && !Par->use_fold) ? malloc((*p_Nloci)*sizeof(double)) : NULL;
   double t_dense0 = cpfold_env ? omp_get_wtime() : 0.0;
-  int finalrun= (run_num == (Par->EMruns-1));
   double Alphasum = 0.0;
 
   if(Par->use_fold){
     /* -fold: replace the O(N*K) dense FB with the exact O(N*Umean) block fold.
-       Produces per-pop chunk counts (coancestry), per-pop expected_differences
-       (for the -iM global-mutation EM update) and N_e_new (for the -in N_e EM
-       update), so -fold drives the full -i N -in -iM EM loop. Per-pop totals are
-       exact, distributed uniformly within each donor pop so total_counts /
-       total_differences are reproduced. (chunk-LENGTH + regional outputs are not
-       produced; uniform copy_prob + global mutation assumed - guarded at parse.) */
+       Produces per-pop chunk counts (coancestry), expected chunk lengths,
+       expected_differences (for the -iM global-mutation EM update), N_e_new (for
+       the -in N_e EM update) and the forward log-likelihood, so -fold drives the
+       full -i N -in -iM EM loop. Per-pop totals are exact, distributed uniformly
+       within each donor pop so the per-pop output totals are reproduced. (regional
+       bootstrap + samples are not produced.) */
+    if(*p_Nloci < 2){ fprintf(Par->out,"ERROR: -fold requires at least 2 loci. Exiting...\n"); stop_on_error(1,Par->errormode,Par->err); }
     double *fpp=calloc(ndonorpops,sizeof(double)), *fdiff=calloc(ndonorpops,sizeof(double)), *flen=calloc(ndonorpops,sizeof(double));
     int *cntp=calloc(ndonorpops,sizeof(int));
     for(i=0;i<*p_Nhaps;i++) cntp[pop_vec[i]]++;
-    double tb=0,tf=0;
+    double tb=0,tf=0,foldloglik=0.0;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
                   copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops,
-                  Par->fold_ustar, fpp, fdiff, flen, &N_e_new, &tb, &tf);
+                  Par->fold_ustar, fpp, fdiff, flen, &N_e_new, &foldloglik, &tb, &tf);
+    Alphasum = foldloglik;
+    /* write the forward log-likelihood to .EMprobs.out, same column the dense
+       writes at the matching point (keeps the EMPAR row layout identical). */
+    if(Outfiles->usingFile[2]) fprintf(Outfiles->fout3," %.10lf",foldloglik);
     /* per-pop totals are exact; distributed uniformly within each donor pop so
        total_counts / total_differences / total_lengths are reproduced. */
     for(i=0;i<*p_Nhaps;i++){ int p=pop_vec[i];
@@ -620,10 +637,10 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
     double *ccfold=malloc(ndonorpops*sizeof(double)), *cdfold=malloc(ndonorpops*sizeof(double)), *clfold=malloc(ndonorpops*sizeof(double));
     double *ccdense=calloc(ndonorpops,sizeof(double)), *cddense=calloc(ndonorpops,sizeof(double)), *cldense=calloc(ndonorpops,sizeof(double));
     for (i=0; i < *p_Nhaps; i++){ ccdense[pop_vec[i]]+=corrected_chunk_count[i]; cddense[pop_vec[i]]+=expected_differences[i]; cldense[pop_vec[i]]+=expected_chunk_length[i]; }
-    double t_build=0, t_fold=0, Ne_fold=0;
+    double t_build=0, t_fold=0, Ne_fold=0, ll_fold=0;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
                   copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops, Ustar,
-                  ccfold, cdfold, clfold, &Ne_fold, &t_build, &t_fold);
+                  ccfold, cdfold, clfold, &Ne_fold, &ll_fold, &t_build, &t_fold);
     double mre=0,mrd=0,mrl=0; for(int p=0;p<ndonorpops;p++){
       double e=fabs(ccfold[p]-ccdense[p])/(fabs(ccdense[p])+1e-300); if(e>mre)mre=e;
       double d=fabs(cdfold[p]-cddense[p])/(fabs(cddense[p])+1e-300); if(d>mrd)mrd=d;
@@ -650,7 +667,12 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
 	   copy_prob_newSTART[i] = copy_probSTART[i];
 	 }
 
-           /* calculate Alphasums (for efficient sampling): */
+           /* calculate Alphasums (for efficient sampling). Only when samples are
+              actually requested: this log-sum-exp reads Alphamat as LOG-space, and
+              the forward is run in log-space (use_lin forced false) exactly when
+              samplesTOT>0 on the final run; guarding here makes that invariant
+              explicit and skips a wasted O(N*K) pass when no samples are produced. */
+       if (Par->samplesTOT > 0) {
        for (locus=0; locus < *p_Nloci; locus++)
 	 {
 	   Alphasumvec[locus] = 0.0;
@@ -665,6 +687,7 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
 	     Alphasumvec[locus] = Alphasumvec[locus] + exp(Alphamat[locus][i]+large_num);
 	   Alphasumvec[locus] = log(Alphasumvec[locus]) - large_num;
 	 }
+       }
 
               /* SAMPLING ALGORITHM: (from Falush, Stephens, & Pritchard (2003) Genetics 164:1567-1587) */
        for (j = 0; j < Par->samplesTOT; j++)
