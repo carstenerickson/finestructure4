@@ -178,6 +178,45 @@ static Groups build_groups(int B){
 static void free_groups(Groups *G){ free(G->blk);free(G->gidB);free(G->sizeg);free(G->repg);free(G->popg);
     free(G->cellB);free(G->celloff);free(G->cellGb);free(G->cellG2); }
 
+/* L4 build-once-serve-many: the grouping+contingency is PANEL-FIXED (target-
+   independent), so serialize it once and have every target's run LOAD it instead
+   of rebuilding. Production paints one target/process against a fixed panel, so
+   this moves the dominant single-target cost (the O(N*K) build) off the per-target
+   path - it converges single-target toward the grouping-amortized per-recipient. */
+static void save_groups(Groups *G, const char *path){
+    FILE *f=fopen(path,"wb"); if(!f){perror("save_groups");exit(1);}
+    int total=G->celloff[G->nb];
+    int hdr[6]={G->B,G->nb,G->Umax,G->maxcell,K,total};
+    fwrite(hdr,sizeof(int),6,f);
+    fwrite(G->blk,sizeof(Block),G->nb,f);
+    fwrite(G->gidB,sizeof(int),(size_t)G->nb*K,f);
+    fwrite(G->sizeg,sizeof(int),(size_t)G->nb*G->Umax,f);
+    fwrite(G->repg,sizeof(int),(size_t)G->nb*G->Umax,f);
+    fwrite(G->popg,sizeof(int),(size_t)G->nb*G->Umax,f);
+    fwrite(G->cellB,sizeof(int),(size_t)G->nb*K,f);
+    fwrite(G->celloff,sizeof(int),(size_t)G->nb+1,f);
+    fwrite(G->cellGb,sizeof(int),(size_t)total,f);
+    fwrite(G->cellG2,sizeof(int),(size_t)total,f);
+    fclose(f);
+}
+static Groups load_groups(const char *path){
+    Groups G; FILE *f=fopen(path,"rb"); if(!f){perror("load_groups");exit(1);}
+    int hdr[6]; if(fread(hdr,sizeof(int),6,f)!=6){fprintf(stderr,"bad groupfile\n");exit(1);}
+    G.B=hdr[0];G.nb=hdr[1];G.Umax=hdr[2];G.maxcell=hdr[3];
+    if(hdr[4]!=K){fprintf(stderr,"groupfile K=%d != data K=%d\n",hdr[4],K);exit(1);}
+    int total=hdr[5]; size_t nbK=(size_t)G.nb*K, nbU=(size_t)G.nb*G.Umax, tt=total<1?1:total;
+    G.blk=malloc(sizeof(Block)*G.nb);            fread(G.blk,sizeof(Block),G.nb,f);
+    G.gidB=malloc(sizeof(int)*nbK);              fread(G.gidB,sizeof(int),nbK,f);
+    G.sizeg=malloc(sizeof(int)*nbU);             fread(G.sizeg,sizeof(int),nbU,f);
+    G.repg=malloc(sizeof(int)*nbU);              fread(G.repg,sizeof(int),nbU,f);
+    G.popg=malloc(sizeof(int)*nbU);              fread(G.popg,sizeof(int),nbU,f);
+    G.cellB=malloc(sizeof(int)*nbK);             fread(G.cellB,sizeof(int),nbK,f);
+    G.celloff=malloc(sizeof(int)*((size_t)G.nb+1)); fread(G.celloff,sizeof(int),(size_t)G.nb+1,f);
+    G.cellGb=malloc(sizeof(int)*tt);             fread(G.cellGb,sizeof(int),(size_t)total,f);
+    G.cellG2=malloc(sizeof(int)*tt);             fread(G.cellG2,sizeof(int),(size_t)total,f);
+    fclose(f); return G;
+}
+
 /* ADAPTIVE block boundaries (PBWT-style): grow each block by incrementally
    splitting the substring grouping column-by-column; cut when U reaches Ustar.
    Blocks are long where local diversity is low (-> fewer boundaries, less boundary
@@ -344,9 +383,11 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
 }
 
 int main(int argc, char**argv){
-    if(argc<3){ fprintf(stderr,"usage: %s cdata.bin blocksize|Ustar [reps] [ad]\n",argv[0]); return 1; }
+    if(argc<3){ fprintf(stderr,"usage: %s cdata.bin blocksize|Ustar [reps] [ad] [save=f|load=f]\n",argv[0]); return 1; }
     int B = atoi(argv[2]);
     int adaptive = (argc>4 && strcmp(argv[4],"ad")==0); /* arg5=="ad" -> PBWT adaptive blocks, B used as Ustar */
+    const char *savep=NULL,*loadp=NULL;   /* L4 build-once-serve-many: cache the panel-fixed grouping */
+    for(int ai=3;ai<argc;ai++){ if(!strncmp(argv[ai],"save=",5))savep=argv[ai]+5; else if(!strncmp(argv[ai],"load=",5))loadp=argv[ai]+5; }
     FILE *f=fopen(argv[1],"rb"); if(!f){perror("open");return 1;}
     int hdr[4]; fread(hdr,sizeof(int),4,f); K=hdr[0];N=hdr[1];npop=hdr[2];nrecip=hdr[3];
     double par[3]; fread(par,sizeof(double),3,f); rhobar=par[0];mut=par[1];copyprob=par[2];
@@ -372,7 +413,8 @@ int main(int argc, char**argv){
     double dense_pp[16]={0}, fold_pp_tot[16]={0};
     int reps = (argc>3)? atoi(argv[3]) : 7;       /* repeat timing, take MIN (denoise) */
 
-    Groups G = adaptive ? build_groups_adaptive(B) : build_groups(B);  /* (timed below; here for the correctness pass) */
+    Groups G = loadp ? load_groups(loadp) : (adaptive ? build_groups_adaptive(B) : build_groups(B));  /* (timed below) */
+    if(savep){ save_groups(&G,savep); printf("  saved panel grouping -> %s\n",savep); }
     { long sumU=0, slots=0; int Ufold=0; for(int b=0;b<G.nb;b++){ sumU+=G.blk[b].U; slots+=(long)(G.blk[b].e-G.blk[b].s)*G.blk[b].U; if(G.blk[b].U>Ufold)Ufold=G.blk[b].U; }
       printf("  grouping[%s]: %d blocks, Umean=%.1f Umax=%d (vs K=%d -> fold ratio %.1fx), mean block len=%.1f, interior slots N*Umean=%ld vs N*K=%ld\n",
              adaptive?"adaptive":"fixed", G.nb, (double)sumU/G.nb, Ufold, K, (double)K/((double)sumU/G.nb), (double)N/G.nb, slots, (long)N*K); }
@@ -389,7 +431,8 @@ int main(int argc, char**argv){
         double t0=now_s();
         for(int r=0;r<nrecip;r++){ fill_E(E,r); dense_cc(E,cc,a,c,As,Bs); }
         double d=now_s()-t0; if(d<td)td=d;
-        double tg0=now_s(); Groups Gt = adaptive ? build_groups_adaptive(B) : build_groups(B); double g=now_s()-tg0; if(g<tg)tg=g; free_groups(&Gt);
+        double tg0=now_s(); Groups Gt = loadp ? load_groups(loadp) : (adaptive ? build_groups_adaptive(B) : build_groups(B));
+        double g=now_s()-tg0; if(g<tg)tg=g; free_groups(&Gt);
         double t1=now_s();
         for(int r=0;r<nrecip;r++){ for(int p=0;p<npop;p++)fp[p]=0.0; fold_cc(r,fp,&G); }
         double ff=now_s()-t1; if(ff<tf)tf=ff;
@@ -405,9 +448,9 @@ int main(int argc, char**argv){
     printf("  fold  per-pop:"); for(int p=0;p<npop;p++)printf(" %.6f",fold_pp_tot[p]); printf("\n");
     printf("  dense-vs-pythonref max rel err = %.3e\n",mdr);
     printf("  fold-vs-dense (C)  max rel err = %.3e  (port-defect check; exactness proven in py)\n",mfd);
-    printf("  WALL-CLOCK (%d recipients): dense=%.2f ms  fold=%.2f ms (+ grouping %.2f ms built once)\n",
-           nrecip, td*1e3, tf*1e3, tg*1e3);
-    printf("    per-recipient (grouping amortized):  %.2fx   |   single-target (grouping incl): %.2fx\n",
-           td/tf, td/(tf+tg));
+    printf("  WALL-CLOCK (%d recipients): dense=%.2f ms  fold=%.2f ms (+ %s %.2f ms)\n",
+           nrecip, td*1e3, tf*1e3, loadp?"grouping LOADED":"grouping built once", tg*1e3);
+    printf("    per-recipient (grouping amortized):  %.2fx   |   single-target (%s): %.2fx\n",
+           td/tf, loadp?"grouping LOADED, L4":"grouping incl", td/(tf+tg));
     return 0;
 }
