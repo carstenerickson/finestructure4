@@ -567,7 +567,15 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
 
   if(Par->vverbose) fprintf(Par->out,"        sampler: forwards algorithm\n");
       /* FORWARDS ALGORITHM: (Rabiner 1989, p.262) */
+  /* The CPFOLD=1 fold-vs-dense benchmark is dev-only scaffolding (it runs a SECOND
+     full fold pass per recipient). Excluded from release builds: cpfold_env is NULL
+     unless compiled with -DCP_FOLD_BENCH, so a stray CPFOLD=1 has no effect and the
+     benchmark blocks below are dead-code-eliminated. */
+#ifdef CP_FOLD_BENCH
   char *cpfold_env = getenv("CPFOLD");
+#else
+  char *cpfold_env = NULL;
+#endif
   int finalrun= (run_num == (Par->EMruns-1));
   /* linear-space dense is the DEFAULT (PR1); CPLOG=1 forces the old log-space path
      for A/B validation. The path-sampling block below reads Alphamat as LOG-space,

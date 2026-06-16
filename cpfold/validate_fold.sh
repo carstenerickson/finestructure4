@@ -100,6 +100,31 @@ if [ -f "$PB" ]; then
   cmp_set "$TMP/d_pm" "$TMP/f_pm" "fold == dense   [-p -m]"
 fi
 
+# --- all-vs-all (-a): -fold is exact here too (each individual is its own donor
+#     pop, so the within-pop redistribution is a no-op). ---
+echo "=== all-vs-all fold == dense (win, -a 0 0 -i 0) ==="
+env OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" -t "$ID" -f "$POP" -a 0 0 \
+    -s 0 -i 0 -n "$NE" -M "$MUT"       -o "$TMP/d_a" >/dev/null 2>&1
+env OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" -t "$ID" -f "$POP" -a 0 0 \
+    -s 0 -i 0 -n "$NE" -M "$MUT" -fold -o "$TMP/f_a" >/dev/null 2>&1
+cmp_set "$TMP/d_a" "$TMP/f_a" "fold == dense   [-a 0 0]"
+
+# --- output suppression: -fold must NOT write the regional bootstrap files (a
+#     zero-filled .regionsquaredchunkcounts.out would collapse chromocombine's c)
+#     and must REJECT the per-locus -b/-d outputs it cannot produce. ---
+echo "=== -fold output suppression ==="
+env OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" -t "$ID" -f "$POP" 0 0 \
+    -s 0 -i 0 -k 5 -n "$NE" -M "$MUT" -fold -o "$TMP/sup" >/dev/null 2>&1
+if [ -f "$TMP/sup.regionchunkcounts.out" ] || [ -f "$TMP/sup.regionsquaredchunkcounts.out" ]; then
+  echo "  FAIL  regional files present under -fold"; fail=1
+else echo "  PASS  regional files absent under -fold"; fi
+for fl in -b -d; do
+  if env OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" -t "$ID" -f "$POP" 0 0 \
+      -s 0 -i 0 $fl -fold -n "$NE" -M "$MUT" -o "$TMP/rej" >/dev/null 2>&1; then
+    echo "  FAIL  $fl accepted under -fold"; fail=1
+  else echo "  PASS  $fl rejected under -fold"; fi
+done
+
 # --- path-sampling consistency (PR1): the linear-space default must produce the
 #     SAME samples as the log-space reference. forwardAlgorithmLin fills Alphamat
 #     LINEAR but the sampler reads it LOG-space, so the FINAL (sampling) run falls
@@ -124,10 +149,15 @@ samp_cmp() { # iters label
 samp_cmp "-i 0"              "single sampling run"
 samp_cmp "-i 4 -in -iM"     "linear E-M + log final run"
 
-echo "=== inline per-pop rel err (CPFOLD=1, -i 0, $ds) ==="
-env CPFOLD=1 OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" \
+# Full-precision per-pop rel err: only available when fs is built with the dev
+# benchmark, i.e. -DCP_FOLD_BENCH (the CPFOLD=1 scaffolding is excluded from
+# release builds). Absent => this prints the note; the byte-identity gate above
+# is the real check and does not need it.
+echo "=== inline per-pop rel err (CPFOLD=1, requires -DCP_FOLD_BENCH build) ==="
+relerr=$(env CPFOLD=1 OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" \
     -t "$ID" -f "$POP" 0 0 -s 0 -i 0 -n "$NE" -M "$MUT" -d -o "$TMP/b" 2>/dev/null \
-    | grep "max rel err" | head -1
+    | grep "max rel err" | head -1)
+[ -n "$relerr" ] && echo "$relerr" || echo "  (skipped: fs not built with -DCP_FOLD_BENCH)"
 
 echo
 if [ $fail -eq 0 ]; then echo "ALL EXACT (byte-identical at printed precision)"; else echo "SOME CONFIGS DIFFER - see FAIL lines above"; fi

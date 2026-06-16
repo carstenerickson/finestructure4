@@ -176,6 +176,7 @@ void assignParameters(struct param_t *Par,struct infiles_t *Infiles,struct files
 	   stop_on_error(1,Par->errormode,Par->err);
 	 }
 	 Par->fold_ustar=atoi(argv[i+1]);
+	 Par->use_fold=1;   /* -foldU implies -fold */
        }
        if (strcmp(argv[i],"-p")==0)
 	 Par->prior_donor_probs_ind=1;
@@ -591,7 +592,22 @@ int chromopainter(int argc, char *argv[])
 
   fprintf(Par->out,"Assigning parameters from command line\n");
   assignParameters(Par,Infiles,Outfiles,argc,argv);
-  
+
+  /* -fold cannot produce the per-region / per-locus outputs (the block fold
+     dissolves the per-region bootstrap and the per-locus copy structure). Suppress
+     the default-on regional files so they are ABSENT rather than written as zeros
+     (a zero .regionsquaredchunkcounts.out silently collapses chromocombine's c
+     estimate), and reject the explicitly-requested -b/-d outputs with a clear
+     error. Done before openOutfiles so the files are never created. */
+  if(Par->use_fold){
+    Outfiles->usingFile[6]=0;   /* .regionchunkcounts.out */
+    Outfiles->usingFile[7]=0;   /* .regionsquaredchunkcounts.out */
+    if(Par->print_file9_ind || Par->printnorecprobs){
+      fprintf(Par->out,"ERROR: -fold cannot produce the per-locus outputs -b (.copyprobsperlocus.out) or -d (.transitionprobs.out); the block fold collapses the per-locus copy structure. Drop -b/-d, or use the dense painter. Exiting...\n");
+      stop_on_error(1,Par->errormode,Par->err);
+    }
+  }
+
   if(Par->vverbose) fprintf(Par->out,"Opening output files\n");
   openOutfiles(Outfiles);
   if(Par->vverbose) fprintf(Par->out,"Validating output files\n");
