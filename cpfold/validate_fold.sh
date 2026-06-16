@@ -125,6 +125,36 @@ for fl in -b -d; do
   else echo "  PASS  $fl rejected under -fold"; fi
 done
 
+# --- independent oracle: fs (dense AND fold) vs a from-scratch reference that
+#     shares NO code with finestructure4. The reference (oracle/independent_oracle.py)
+#     computes the per-pop chunk counts by exact brute-force enumeration of all 4^6
+#     donor paths, cross-checked by a formula-free Monte Carlo. This catches a shared
+#     bug in the emission / transition / chunk-count code that a fold-vs-dense diff
+#     cannot (both share cp_emis). The case includes a missing allele (9). ---
+OD="$(dirname "$D")/oracle"
+if [ -f "$OD/data.phase" ]; then
+  echo "=== independent oracle (brute-force + MC) vs fs dense and fold ==="
+  EXP_A=1.4288035005; EXP_B=1.2117673272   # exact, from oracle/expected.txt
+  orun() { # extra outprefix
+    env OMP_NUM_THREADS=1 $1 "$FS" cp -g "$OD/data.phase" -r "$OD/data.recom" \
+        -t "$OD/id.txt" -f "$OD/poplist.txt" 0 0 -j -s 0 -i 0 -n 100 -M 0.01 $2 -o "$3" >/dev/null 2>&1
+  }
+  ocheck() { # label chunkcounts-file
+    awk -v ea="$EXP_A" -v eb="$EXP_B" -v lab="$2" '
+      function abs(x){return x<0?-x:x}
+      END{
+        if(a=="" ){ print "  FAIL  "lab" (no output)"; exit 1 }
+        da=abs(a-ea); db=abs(b-eb);
+        if(da<1e-5 && db<1e-5) printf "  PASS  %s (popA %.6f popB %.6f, |d|<1e-5 vs exact)\n",lab,a,b;
+        else { printf "  FAIL  %s popA=%.6f(d=%.1e) popB=%.6f(d=%.1e)\n",lab,a,da,b,db; exit 1 }
+      }
+      $1=="TGT"{a=$2;b=$3}' "$1"
+  }
+  orun "CPLOG=1" ""      "$TMP/odlog"; ocheck "$TMP/odlog.chunkcounts.out" "log-dense  == oracle" || fail=1
+  orun ""        ""      "$TMP/odlin"; ocheck "$TMP/odlin.chunkcounts.out" "lin-dense  == oracle" || fail=1
+  orun ""        "-fold" "$TMP/ofold"; ocheck "$TMP/ofold.chunkcounts.out" "fold       == oracle" || fail=1
+fi
+
 # --- path-sampling consistency (PR1): the linear-space default must produce the
 #     SAME samples as the log-space reference. forwardAlgorithmLin fills Alphamat
 #     LINEAR but the sampler reads it LOG-space, so the FINAL (sampling) run falls

@@ -1,0 +1,14 @@
+# Independent-oracle reference chunk counts for the tiny case (cpfold/oracle/data.*).
+# Computed by independent_oracle.py (exact brute-force enumeration over all 4^6 donor
+# paths, sharing NO code with finestructure4), and cross-checked by an independent
+# Monte-Carlo implementation (formula-free, 4e6 samples). Both agree with fs cp
+# (dense and -fold) to printed precision. The case includes a missing allele (9) in
+# a recipient locus and a donor locus, so it independently exercises the r==9
+# emission branch. fs invocation:
+#   fs cp -g data.phase -r data.recom -t id.txt -f poplist.txt 0 0 -j -s 0 -i 0 -n 100 -M 0.01
+#
+# pop  brute_force_exact   monte_carlo_4e6
+popA   1.4288035005        1.428518
+popB   1.2117673272        1.212272
+# forward_loglik = -3.526628396865989
+# per-donor (exact): A1=1.2537985710 A2=0.1750049295 B1=0.5975518623 B2=0.6142154649
