@@ -168,6 +168,10 @@ void assignParameters(struct param_t *Par,struct infiles_t *Infiles,struct files
 	 Par->haploid_ind=1;
        if (strcmp(argv[i],"-u")==0)
 	 Par->unlinked_ind=1;
+       if (strcmp(argv[i],"-fold")==0)
+	 Par->use_fold=1;
+       if (strcmp(argv[i],"-foldU")==0)
+	 Par->fold_ustar=atoi(argv[i+1]);
        if (strcmp(argv[i],"-p")==0)
 	 Par->prior_donor_probs_ind=1;
        if (strcmp(argv[i],"-b")==0) {

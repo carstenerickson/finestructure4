@@ -519,8 +519,10 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
   // line bytes → vectorizable, prefetcher-friendly. One huge contiguous
   // storage block (~40 GB for chr1) avoids the jagged-2D TLB pressure
   // of the upstream code.
-  double * Alphamat_storage = malloc(((size_t)*p_Nloci) * ((size_t)*p_Nhaps) * sizeof(double));
-  double ** Alphamat = malloc(*p_Nloci * sizeof(double *));
+  // -fold uses its own O(N*Umean) memory and never touches Alphamat, so skip the
+  // O(N*K) (~40 GB for chr1) dense storage entirely under -fold.
+  double * Alphamat_storage = Par->use_fold ? NULL : malloc(((size_t)*p_Nloci) * ((size_t)*p_Nhaps) * sizeof(double));
+  double ** Alphamat = Par->use_fold ? NULL : malloc(*p_Nloci * sizeof(double *));
   double * copy_prob_new = malloc(*p_Nhaps * sizeof(double));
   double * copy_prob_newSTART = malloc(*p_Nhaps * sizeof(double));
   double * Alphasumvec = malloc(*p_Nloci * sizeof(double));
@@ -536,10 +538,11 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
   // Each Alphamat[locus] points to the locus-th column of n_haps
   // doubles within Alphamat_storage. We reuse `i` as a generic
   // counter for `locus` here to avoid declaring a new variable.
-  for(i=0 ; i< *p_Nloci ; i++)
-    {
-      Alphamat[i] = Alphamat_storage + ((size_t)i) * ((size_t)*p_Nhaps);
-    }
+  if(!Par->use_fold)
+    for(i=0 ; i< *p_Nloci ; i++)
+      {
+        Alphamat[i] = Alphamat_storage + ((size_t)i) * ((size_t)*p_Nhaps);
+      }
   for (i=0; i < ndonorpops; i++)
     {
       regional_chunk_count_sum_final[i] = 0.0;
@@ -561,28 +564,49 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
       /* FORWARDS ALGORITHM: (Rabiner 1989, p.262) */
   char *cpfold_env = getenv("CPFOLD");
   int use_lin = getenv("CPLINEAR") != NULL;   /* linear-space O(N)-transcendental dense */
-  double *Asvec = use_lin ? malloc((*p_Nloci)*sizeof(double)) : NULL;
+  double *Asvec = (use_lin && !Par->use_fold) ? malloc((*p_Nloci)*sizeof(double)) : NULL;
   double t_dense0 = cpfold_env ? omp_get_wtime() : 0.0;
-  double Alphasum = use_lin
-    ? forwardAlgorithmLin(newh, existing_h, Alphamat, Asvec, MutProb_vec, p_Nhaps,p_Nloci,copy_prob, copy_probSTART, TransProb,Par)
-    : forwardAlgorithm(newh, existing_h, Alphamat, MutProb_vec, p_Nhaps,p_Nloci,copy_prob, copy_probSTART, TransProb,Par);
-
-  if(Outfiles->usingFile[2]) fprintf(Outfiles->fout3," %.10lf",Alphasum);
-
-  if(Par->vverbose) fprintf(Par->out,"        sampler: backwards algorithm\n");
   int finalrun= (run_num == (Par->EMruns-1));
-  if(run_num <= (Par->EMruns-1)){
-    if(use_lin)
-      backwardAlgorithmLin(finalrun,ndonorpops,ind_val,Alphasum,p_rhobar,&N_e_new,newh,existing_h,Alphamat,Asvec,lambda,delta,MutProb_vec,p_Nhaps,p_Nloci,copy_prob,copy_prob_new,copy_prob_newSTART, corrected_chunk_count, expected_chunk_length, expected_differences,regional_chunk_count_sum_final,regional_chunk_count_sum_squared_final, &num_regions, copy_probSTART, TransProb, pop_vec,pos,snp_info_measure,Outfiles,Par);
-    else
-      backwardAlgorithm(finalrun,ndonorpops,ind_val,Alphasum,p_rhobar,&N_e_new,newh,existing_h,Alphamat,lambda,delta,MutProb_vec,p_Nhaps,p_Nloci,copy_prob,copy_prob_new,copy_prob_newSTART, corrected_chunk_count, expected_chunk_length, expected_differences,regional_chunk_count_sum_final,regional_chunk_count_sum_squared_final, &num_regions, copy_probSTART, TransProb, pop_vec,pos,snp_info_measure,Outfiles,Par);
+  double Alphasum = 0.0;
+
+  if(Par->use_fold){
+    /* -fold: replace the O(N*K) dense FB with the exact O(N*Umean) block fold.
+       Produces per-pop chunk counts (the coancestry); the per-pop total is exact,
+       distributed uniformly within each donor pop so total_counts is reproduced.
+       Chunk-counts only: lengths/differences/regional are zeroed (deterministic
+       -i 0 mode; uniform copy_prob + global mutation assumed). */
+    double *fpp=calloc(ndonorpops,sizeof(double)); int *cntp=calloc(ndonorpops,sizeof(int));
+    for(i=0;i<*p_Nhaps;i++) cntp[pop_vec[i]]++;
+    double tb=0,tf=0;
+    cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
+                  copy_prob, pop_vec, ndonorpops, Par->fold_ustar, fpp, &tb, &tf);
+    for(i=0;i<*p_Nhaps;i++){ int p=pop_vec[i];
+      corrected_chunk_count[i]=(cntp[p]>0)?fpp[p]/cntp[p]:0.0;
+      expected_chunk_length[i]=0.0; expected_differences[i]=0.0;
+      copy_prob_new[i]=copy_prob[i]; copy_prob_newSTART[i]=copy_probSTART[i]; }
+    for(i=0;i<ndonorpops;i++){ regional_chunk_count_sum_final[i]=0.0; regional_chunk_count_sum_squared_final[i]=0.0; snp_info_measure[i]=0.0; }
+    num_regions=0; N_e_new=p_rhobar;
+    if(cpfold_env) fprintf(Par->out,"[CPFOLD-prod] N=%d K=%d Ustar=%d  fold=%.2f ms (+grouping %.2f ms)\n",*p_Nloci,*p_Nhaps,Par->fold_ustar,tf*1e3,tb*1e3);
+    free(fpp); free(cntp);
+  } else {
+    Alphasum = use_lin
+      ? forwardAlgorithmLin(newh, existing_h, Alphamat, Asvec, MutProb_vec, p_Nhaps,p_Nloci,copy_prob, copy_probSTART, TransProb,Par)
+      : forwardAlgorithm(newh, existing_h, Alphamat, MutProb_vec, p_Nhaps,p_Nloci,copy_prob, copy_probSTART, TransProb,Par);
+    if(Outfiles->usingFile[2]) fprintf(Outfiles->fout3," %.10lf",Alphasum);
+    if(Par->vverbose) fprintf(Par->out,"        sampler: backwards algorithm\n");
+    if(run_num <= (Par->EMruns-1)){
+      if(use_lin)
+        backwardAlgorithmLin(finalrun,ndonorpops,ind_val,Alphasum,p_rhobar,&N_e_new,newh,existing_h,Alphamat,Asvec,lambda,delta,MutProb_vec,p_Nhaps,p_Nloci,copy_prob,copy_prob_new,copy_prob_newSTART, corrected_chunk_count, expected_chunk_length, expected_differences,regional_chunk_count_sum_final,regional_chunk_count_sum_squared_final, &num_regions, copy_probSTART, TransProb, pop_vec,pos,snp_info_measure,Outfiles,Par);
+      else
+        backwardAlgorithm(finalrun,ndonorpops,ind_val,Alphasum,p_rhobar,&N_e_new,newh,existing_h,Alphamat,lambda,delta,MutProb_vec,p_Nhaps,p_Nloci,copy_prob,copy_prob_new,copy_prob_newSTART, corrected_chunk_count, expected_chunk_length, expected_differences,regional_chunk_count_sum_final,regional_chunk_count_sum_squared_final, &num_regions, copy_probSTART, TransProb, pop_vec,pos,snp_info_measure,Outfiles,Par);
+    }
   }
   if(Asvec) free(Asvec);
 
   /* ---- CPFOLD benchmark: exact block-fold of the chunk counts (env CPFOLD=1) ----
      Runs the O(N*Umean) fold on the SAME data + TransProb the dense just used,
      compares per-pop chunk counts, and reports dense-FB vs fold wall-clock. */
-  if(cpfold_env && finalrun){
+  if(cpfold_env && !Par->use_fold && finalrun){
     double t_dense = omp_get_wtime() - t_dense0;
     int Ustar = getenv("CPFOLD_USTAR") ? atoi(getenv("CPFOLD_USTAR")) : 24;
     double *ccfold = malloc(ndonorpops*sizeof(double));
@@ -601,9 +625,9 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
     free(ccfold); free(ccdense);
   }
 
-  //////////////////////////////// 
+  ////////////////////////////////
       /* print-out samples if we've done enough iterations: */
-   if (finalrun)
+   if (finalrun && !Par->use_fold)   /* -fold has no Alphamat to sample from (-s 0 only) */
      {
        if(Par->vverbose) fprintf(Par->out,"        sampler: printing.\n");
 
