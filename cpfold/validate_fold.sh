@@ -49,6 +49,28 @@ for ds in win200 win800 win win20k; do
   done
 done
 
+# --- per-pop fold exactness (PR2b): FIXED per-pop copy probs (-p) and/or FIXED
+#     per-pop mutation rates (-m). The fold groups donors by (substring, pop),
+#     so dense == fold at the per-pop output granularity. -m excludes -M. ---
+runpp() { # poplist extra_args outprefix
+  env OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" \
+      -t "$ID" -f "$1" 0 0 -s 0 -i 0 -n "$NE" $2 -o "$3" >/dev/null 2>&1
+}
+PR="$D/cp.poplist.prior"; PM="$D/cp.poplist.mut"; PB="$D/cp.poplist.pm"
+echo "=== per-pop fold == dense (win, -i 0) ==="
+if [ -f "$PR" ]; then
+  runpp "$PR" "-M $MUT -p"        "$TMP/d_p";  runpp "$PR" "-M $MUT -p -fold"        "$TMP/f_p"
+  cmp_set "$TMP/d_p"  "$TMP/f_p"  "fold == dense   [-p]"
+fi
+if [ -f "$PM" ]; then
+  runpp "$PM" "-m $MUT"           "$TMP/d_m";  runpp "$PM" "-m $MUT -fold"           "$TMP/f_m"
+  cmp_set "$TMP/d_m"  "$TMP/f_m"  "fold == dense   [-m]"
+fi
+if [ -f "$PB" ]; then
+  runpp "$PB" "-p -m $MUT"        "$TMP/d_pm"; runpp "$PB" "-p -m $MUT -fold"        "$TMP/f_pm"
+  cmp_set "$TMP/d_pm" "$TMP/f_pm" "fold == dense   [-p -m]"
+fi
+
 echo "=== inline per-pop rel err (CPFOLD=1, -i 0, $ds) ==="
 env CPFOLD=1 OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" \
     -t "$ID" -f "$POP" 0 0 -s 0 -i 0 -n "$NE" -M "$MUT" -d -o "$TMP/b" 2>/dev/null \

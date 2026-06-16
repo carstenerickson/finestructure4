@@ -23,7 +23,11 @@
 
 /* engine globals (set per call by cpfold_perpop; single-threaded engine) */
 static int K, N, npop;
-static double copyprob, mut;
+/* per-donor copy_prob / copy_probSTART / mutation rate. Uniform in the common
+   case (one global value); per-population under -p (fixed per-pop copy_prob) and
+   -m (fixed per-pop mutation), which the engine handles by grouping the state by
+   (substring,pop) so copy_prob/mutation are constant within each group. */
+static double *cf_cp, *cf_cps, *cf_mut;
 static uint8_t *donors;     /* [N*K] locus-major, built from existing_h */
 static int *pop_vec;        /* [K] donor population */
 static double *T;           /* [N-1] transition (the caller's TransProb) */
@@ -31,12 +35,12 @@ static double *pos_g, *lam_g, delta_g, rho_g;  /* for the N_e (-in) EM update */
 
 static double cf_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec + t.tv_nsec*1e-9; }
 
-/* emission e(recipient allele r, donor allele d) - matches cp exactly:
-   r==9 -> 1.0 (recipient missing ignored); r==8 -> gap (SMALL_NUM); else (1-mut)/mut. */
-static inline double emis(int r, int d){
+/* emission e(recipient allele r, donor allele d, donor mutation m):
+   r==9 -> 1.0 (recipient missing ignored); r==8 -> gap (SMALL_NUM); else (1-m)/m. */
+static inline double emis(int r, int d, double m){
     if(r==9) return 1.0;
     if(r==8) return (r==d)?(1-CF_SMALL_NUM):CF_SMALL_NUM;
-    return (r==d)?(1-mut):mut;
+    return (r==d)?(1-m):m;
 }
 
 typedef struct { int s,e,U; } Block;
@@ -77,7 +81,7 @@ static void free_groups(Groups *G){ free(G->blk);free(G->gidB);free(G->sizeg);fr
 /* PBWT adaptive variable-length blocks: grow each block by incrementally
    splitting the substring grouping column-by-column; cut when U reaches Ustar.
    16-way allele code (al&15) keeps all cp allele symbols 0-5,8,9 distinct. */
-static Groups build_groups_adaptive(int Ustar){
+static Groups build_groups_adaptive(int Ustar, int bypop){
     Groups G; G.B=Ustar; G.nb=0;
     int cap_blk=64; G.blk=malloc(sizeof(Block)*cap_blk); int *gidB=NULL;
     int *gid=malloc(sizeof(int)*K), *ng=malloc(sizeof(int)*K);
@@ -86,7 +90,9 @@ static Groups build_groups_adaptive(int Ustar){
        multi-allelic data, so size by K (not Ustar) to be overflow-proof. */
     int mapsz=K*16+16;
     int *mp=malloc(sizeof(int)*mapsz), *mstamp=calloc(mapsz,sizeof(int)); int gen=0, Umax=0;
-    int a=0; for(int i=0;i<K;i++) gid[i]=0; int U=1; int b=0;
+    /* bypop seeds each block grouped by pop (gid=pop_vec), so every group is
+       single-pop and copy_prob/mutation are group-constant; else substring-only. */
+    int a=0; for(int i=0;i<K;i++) gid[i]=bypop?pop_vec[i]:0; int U=bypop?npop:1; int b=0;
     while(b<N){
         gen++; int newU=0; const uint8_t *col=donors+(size_t)b*K;
         for(int i=0;i<K;i++){ int code=col[i]&15; int ek=gid[i]*16+code;
@@ -96,7 +102,7 @@ static Groups build_groups_adaptive(int Ustar){
             G.blk[G.nb].s=a; G.blk[G.nb].e=b; G.blk[G.nb].U=U;
             gidB=realloc(gidB,(size_t)(G.nb+1)*K*sizeof(int)); memcpy(gidB+(size_t)G.nb*K,gid,K*sizeof(int));
             if(U>Umax)Umax=U; G.nb++;
-            a=b; for(int i=0;i<K;i++) gid[i]=0; U=1;
+            a=b; for(int i=0;i<K;i++) gid[i]=bypop?pop_vec[i]:0; U=bypop?npop:1;
         } else { int *t=gid;gid=ng;ng=t; U=newU; b++; }
     }
     if(G.nb>=cap_blk){ cap_blk*=2; G.blk=realloc(G.blk,sizeof(Block)*cap_blk); }
@@ -119,9 +125,12 @@ static Groups build_groups_adaptive(int Ustar){
 /* FOLDED forward+backward+chunkcount -> per-pop chunk counts (ccpop[npop]).
    Direct port of cpfold.c fold_cc; rh = the recipient allele row. */
 static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nlen, double *Ne_out, Groups *Gr){
-    #define EM(L,II) emis(rh[(L)], donors[(size_t)(L)*K+(II)])
+    #define EM(L,II) emis(rh[(L)], donors[(size_t)(L)*K+(II)], cf_mut[(II)])
     int nb=Gr->nb, Umax=Gr->Umax; Block *blk=Gr->blk; int *gidB=Gr->gidB;
     int *sizeg=Gr->sizeg, *repg=Gr->repg;
+    /* per-(block,group) copy_prob / copy_probSTART (group-constant since each group
+       is single-pop under -p; = the uniform scalar otherwise). */
+    double *CPG=malloc((size_t)nb*Umax*sizeof(double)), *CPSG=malloc((size_t)nb*Umax*sizeof(double));
     size_t *off=malloc(sizeof(size_t)*nb), tot=0;
     for(int b=0;b<nb;b++){ off[b]=tot; tot += (size_t)(blk[b].e-blk[b].s)*blk[b].U; }
     double *GF=malloc(tot*sizeof(double)), *PF=malloc(tot*sizeof(double)), *Eg=malloc(tot*sizeof(double));
@@ -137,7 +146,8 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
     double *Mc=malloc((size_t)Gr->maxcell*npop*sizeof(double)), *Mce=malloc((size_t)Gr->maxcell*npop*sizeof(double));
 
     for(int b=0;b<nb;b++){ int sb=blk[b].s,eb=blk[b].e,U=blk[b].U; int *rp=repg+(size_t)b*Umax;
-        double *base=Eg+off[b];
+        double *base=Eg+off[b]; double *cpg=CPG+(size_t)b*Umax, *cpsg=CPSG+(size_t)b*Umax;
+        for(int g=0;g<U;g++){ cpg[g]=cf_cp[rp[g]]; cpsg[g]=cf_cps[rp[g]]; }
         for(int l=sb;l<eb;l++){ double *row=base+(size_t)(l-sb)*U; for(int g=0;g<U;g++) row[g]=EM(l, rp[g]); } }
 
     double *aprev=calloc(K,sizeof(double));
@@ -145,6 +155,7 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
         int sb=blk[b].s, eb=blk[b].e, U=blk[b].U; int *gb=gidB+(size_t)b*K; int *sz=sizeg+(size_t)b*Umax;
         double *ent=AENTRY+(size_t)b*K, *Sx=SentS+(size_t)b*Umax;
         double *GFb=GF+off[b], *PFb=PF+off[b], *Egb=Eg+off[b];
+        double *cpg=CPG+(size_t)b*Umax, *cpsg=CPSG+(size_t)b*Umax;
         for(int g=0;g<U;g++) Sx[g]=0.0;
         for(int i=0;i<K;i++){ double a=(b==0)?0.0:aprev[i]; ent[i]=a; if(b>0) Sx[gb[i]]+=a; }
         for(int l=sb;l<eb;l++){
@@ -153,9 +164,9 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
             double sumA=0.0;
             for(int g=0;g<U;g++){
                 double eg=Er[g], gv,pv;
-                if(l==sb && b==0){ gv=copyprob*eg; pv=0.0; }
-                else if(l==sb){ gv=eg*copyprob; pv=eg*(1-T[l-1])*rlm1; }
-                else { double fac=eg*(1-T[l-1])*rlm1; gv=eg*copyprob+fac*G[g]; pv=fac*P[g]; }
+                if(l==sb && b==0){ gv=cpsg[g]*eg; pv=0.0; }     /* copy_probSTART at locus 0 */
+                else if(l==sb){ gv=eg*cpg[g]; pv=eg*(1-T[l-1])*rlm1; }
+                else { double fac=eg*(1-T[l-1])*rlm1; gv=eg*cpg[g]+fac*G[g]; pv=fac*P[g]; }
                 G[g]=gv; P[g]=pv; GFr[g]=gv; PFr[g]=pv; sumA += sz[g]*gv + pv*Sx[g];
             }
             double s=(l<N-1)?sumA*T[l]:sumA; As[l]=(l>=1?As[l-1]:0.0)+log(s);
@@ -174,13 +185,13 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
     { double S_end=exp(As[N-2]-Asf);   /* last locus N-1: c=1, a[N-1]=aprev (post-forward) */
       for(int i=0;i<K;i++) if(rh[N-1]!=donors[(size_t)(N-1)*K+i]) ndiff[pop_vec[i]]+=aprev[i]*S_end; }
     double *cexit=malloc(sizeof(double)*K); for(int i=0;i<K;i++) cexit[i]=1.0;
-    { double sb0=0.0; for(int i=0;i<K;i++) sb0+=T[N-2]*copyprob*EM(N-1,i); Bs[N-1]=log(sb0); }
+    { double sb0=0.0; for(int i=0;i<K;i++) sb0+=T[N-2]*cf_cp[i]*EM(N-1,i); Bs[N-1]=log(sb0); }
     for(int b=nb-1;b>=0;b--){
         int sb=blk[b].s, eb=blk[b].e, U=blk[b].U; int *gb=gidB+(size_t)b*K;
         int *sz=sizeg+(size_t)b*Umax;
         int top=(eb-1<N-2)?eb-1:N-2;
         double *w=WB+(size_t)b*K, *Sw=SwS+(size_t)b*Umax, *ent=AENTRY+(size_t)b*K;
-        double *GFb=GF+off[b], *PFb=PF+off[b], *Egb=Eg+off[b];
+        double *GFb=GF+off[b], *PFb=PF+off[b], *Egb=Eg+off[b]; double *cpg=CPG+(size_t)b*Umax;
         for(int g=0;g<U;g++) Sw[g]=0.0;
         for(int gp=0;gp<U*npop;gp++){ szP[gp]=0.0; SaP[gp]=0.0; SwP[gp]=0.0; SawP[gp]=0.0; }
         for(int i=0;i<K;i++){ double wi=EM(top+1,i)*cexit[i]; w[i]=wi; int g=gb[i], p=pop_vec[i]; double ei=ent[i];
@@ -191,7 +202,7 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
             if(l==top){ for(int g=0;g<U;g++){ GBc[g]=1.0; PBc[g]=(1-T[l])*rb; } }
             else { for(int g=0;g<U;g++){ double fac=(1-T[l])*Er1[g]*rb; GBc[g]=1.0+fac*GBp[g]; PBc[g]=fac*PBp[g]; } }
             if(l>0){ double *Er=Egb+(size_t)(l-sb)*U; double sB=0.0;
-                for(int g=0;g<U;g++) sB+=Er[g]*(sz[g]*GBc[g]+PBc[g]*Sw[g]); Bs[l]=Bs[l+1]+log(T[l-1]*copyprob*sB); }
+                for(int g=0;g<U;g++) sB+=cpg[g]*Er[g]*(sz[g]*GBc[g]+PBc[g]*Sw[g]); Bs[l]=Bs[l+1]+log(T[l-1]*sB); }
             double BsR=(l+2<=N-1)?Bs[l+2]:0.0, Asm1=(l>=1)?As[l-1]:0.0;
             double KF1=exp(As[l]+BsR-Asf), KF=exp(Asm1+BsR-Asf), om=(1-T[l]);
             double *GFr=GFb+(size_t)(l-sb)*U, *PFr=PFb+(size_t)(l-sb)*U;
@@ -254,7 +265,7 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
 
     free(off);free(GF);free(PF);free(Eg);free(AENTRY);free(WB);free(CEXIT);free(As);free(Bs);
     free(SentS);free(SwS);free(G);free(P);free(GBp);free(PBp);free(GBc);free(PBc);
-    free(szP);free(SaP);free(SwP);free(SawP);free(aprev);free(cexit);free(Mc);free(Mce);
+    free(szP);free(SaP);free(SwP);free(SawP);free(aprev);free(cexit);free(Mc);free(Mce);free(CPG);free(CPSG);
     #undef EM
 }
 
@@ -262,22 +273,26 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
    the recipient row from newh, sets engine state, builds the (panel-fixed) grouping
    [timed -> *t_build] and runs the fold [timed -> *t_fold]. out_ccpop[ndonorpops]. */
 void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
-                   double *TransProb, double *MutProb_vec, double *copy_prob,
+                   double *TransProb, double *MutProb_vec, double *copy_prob, double *copy_probSTART,
                    double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
                    double *out_ccpop, double *out_ndiff, double *out_nlen, double *out_Ne,
                    double *t_build, double *t_fold){
     K=nhaps; N=nloci; npop=ndonorpops;
-    copyprob=copy_prob[0]; mut=MutProb_vec[0];
+    cf_cp=copy_prob; cf_cps=copy_probSTART; cf_mut=MutProb_vec;
     pop_vec=pop_vec_in; T=TransProb;
     pos_g=pos; lam_g=lambda; delta_g=delta; rho_g=rhobar;
+    /* group state by (substring,pop) only when a per-pop parameter is actually
+       non-uniform (-p or -m); substring-only otherwise (the fast common path). */
+    int bypop=0;
+    for(int i=1;i<K;i++){ if(copy_prob[i]!=copy_prob[0]||copy_probSTART[i]!=copy_probSTART[0]||MutProb_vec[i]!=MutProb_vec[0]){ bypop=1; break; } }
     donors=malloc((size_t)N*K);
     for(int i=0;i<K;i++){ int *row=existing_h[i];
         for(int l=0;l<N;l++) donors[(size_t)l*K+i]=(uint8_t)row[l]; }
     uint8_t *rh=malloc(N); for(int l=0;l<N;l++) rh[l]=(uint8_t)newh[l];
 
     double tb0=cf_now();
-    Groups Gr=build_groups_adaptive(Ustar);
+    Groups Gr=build_groups_adaptive(Ustar, bypop);
     *t_build=cf_now()-tb0;
 
     double tf0=cf_now();

@@ -583,7 +583,7 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
     for(i=0;i<*p_Nhaps;i++) cntp[pop_vec[i]]++;
     double tb=0,tf=0;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
-                  copy_prob, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops,
+                  copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops,
                   Par->fold_ustar, fpp, fdiff, flen, &N_e_new, &tb, &tf);
     /* per-pop totals are exact; distributed uniformly within each donor pop so
        total_counts / total_differences / total_lengths are reproduced. */
@@ -622,7 +622,7 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
     for (i=0; i < *p_Nhaps; i++){ ccdense[pop_vec[i]]+=corrected_chunk_count[i]; cddense[pop_vec[i]]+=expected_differences[i]; cldense[pop_vec[i]]+=expected_chunk_length[i]; }
     double t_build=0, t_fold=0, Ne_fold=0;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
-                  copy_prob, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops, Ustar,
+                  copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops, Ustar,
                   ccfold, cdfold, clfold, &Ne_fold, &t_build, &t_fold);
     double mre=0,mrd=0,mrl=0; for(int p=0;p<ndonorpops;p++){
       double e=fabs(ccfold[p]-ccdense[p])/(fabs(ccdense[p])+1e-300); if(e>mre)mre=e;
