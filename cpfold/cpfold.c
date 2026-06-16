@@ -94,7 +94,38 @@ typedef struct {           /* panel-fixed, target-independent: build ONCE */
     Block *blk;            /* [nb] */
     int *gidB;             /* [nb*K] gid per (block,donor) */
     int *sizeg,*repg,*popg;/* [nb*Umax] */
+    /* L2 boundary join: panel-fixed (g_b,g_{b+1}) contingency per boundary b */
+    int *cellB;           /* [nb*K] cell id of donor i at boundary b (block b->b+1) */
+    int *celloff;         /* [nb+1] prefix sum of cell counts per boundary */
+    int *cellGb,*cellG2;  /* [total cells] the (g_b,g_{b+1}) pair of each cell */
+    int maxcell;          /* max cells over boundaries (sizes the Mc/Mce scratch) */
 } Groups;
+
+/* Build the panel-fixed boundary contingency: for each boundary b (block b -> b+1)
+   enumerate the occupied (g_b, g_{b+1}) cells and tag every donor with its cell id.
+   The L2 boundary chunkcount then folds over these cells instead of per-donor. */
+static void build_contingency(Groups *G){
+    int nb=G->nb, Umax=G->Umax; int *gidB=G->gidB;
+    G->celloff=malloc(sizeof(int)*(size_t)(nb+1));
+    G->cellB=malloc(sizeof(int)*(size_t)nb*K);
+    int *cmap=malloc(sizeof(int)*(size_t)Umax*Umax);            /* dense (g_b,g2)->cellid, gen-stamped */
+    int *cstamp=calloc((size_t)Umax*Umax,sizeof(int)); int gen=0;
+    int capcell=nb*8+16, total=0, maxcell=0;
+    int *cGb=malloc(sizeof(int)*capcell), *cG2=malloc(sizeof(int)*capcell);
+    G->celloff[0]=0;
+    for(int b=0;b<nb-1;b++){
+        gen++; int nc=0; int *gA=gidB+(size_t)b*K, *gB=gidB+(size_t)(b+1)*K; int *cb=G->cellB+(size_t)b*K;
+        for(int i=0;i<K;i++){ int key=gA[i]*Umax+gB[i];
+            if(cstamp[key]!=gen){ cstamp[key]=gen; cmap[key]=nc;
+                if(total+nc>=capcell){ capcell*=2; cGb=realloc(cGb,sizeof(int)*capcell); cG2=realloc(cG2,sizeof(int)*capcell); }
+                cGb[total+nc]=gA[i]; cG2[total+nc]=gB[i]; nc++; }
+            cb[i]=cmap[key]; }
+        total+=nc; G->celloff[b+1]=total; if(nc>maxcell)maxcell=nc;
+    }
+    G->celloff[nb]=total;
+    G->cellGb=cGb; G->cellG2=cG2; G->maxcell=maxcell<1?1:maxcell;
+    free(cmap); free(cstamp);
+}
 
 static Groups build_groups(int B){
     Groups G; G.B=B;
@@ -141,9 +172,11 @@ static Groups build_groups(int B){
         for(int i=0;i<K;i++){int g=gb[i];sz[g]++; if(rp[g]<0){rp[g]=i;pg[g]=pop_vec[i];}}
     }
     free(htkey);free(htgid);free(htstamp);free(Ublk);free(repTmp);free(key);
+    build_contingency(&G);
     return G;
 }
-static void free_groups(Groups *G){ free(G->blk);free(G->gidB);free(G->sizeg);free(G->repg);free(G->popg); }
+static void free_groups(Groups *G){ free(G->blk);free(G->gidB);free(G->sizeg);free(G->repg);free(G->popg);
+    free(G->cellB);free(G->celloff);free(G->cellGb);free(G->cellG2); }
 
 /* ADAPTIVE block boundaries (PBWT-style): grow each block by incrementally
    splitting the substring grouping column-by-column; cut when U reaches Ustar.
@@ -183,6 +216,7 @@ static Groups build_groups_adaptive(int Ustar){
         for(int g=0;g<Ub;g++){sz[g]=0;rp[g]=-1;}
         for(int i=0;i<K;i++){int g=gb[i];sz[g]++; if(rp[g]<0)rp[g]=i;}
     }
+    build_contingency(&G);
     return G;
 }
 
@@ -208,6 +242,8 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
     /* per-(substring-group, pop) moments for the chunkcount scatter [Umax*npop] */
     double *szP=malloc((size_t)Umax*npop*sizeof(double)), *SaP=malloc((size_t)Umax*npop*sizeof(double));
     double *SwP=malloc((size_t)Umax*npop*sizeof(double)), *SawP=malloc((size_t)Umax*npop*sizeof(double));
+    /* L2: per-cell moments for the boundary join-fold [maxcell*npop] */
+    double *Mc=malloc((size_t)Gr->maxcell*npop*sizeof(double)), *Mce=malloc((size_t)Gr->maxcell*npop*sizeof(double));
 
     /* TARGET 3: precompute per-group emissions ONCE (the only gather); fwd/bwd/chunk read contiguous. */
     for(int b=0;b<nb;b++){ int sb=blk[b].s,eb=blk[b].e,U=blk[b].U; int *rp=repg+(size_t)b*Umax;
@@ -276,15 +312,21 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
                     for(int p=0;p<npop;p++){ double s_=szP[base+p]; if(s_==0.0) continue;
                         ccpop[p] += cA*s_ + cB*SaP[base+p] + cC*SwP[base+p] + cD*SawP[base+p]; }
                 }
-            } else if(b+1<nb){   /* boundary locus l=eb-1: per-donor O(K), c_{l+1}=CEXIT[b+1] */
-                int *gb2=gidB+(size_t)(b+1)*K; double *ent2=AENTRY+(size_t)(b+1)*K, *cx2=CEXIT+(size_t)(b+1)*K;
-                double *GF2=GF+off[b+1], *PF2=PF+off[b+1];   /* row 0 = block b+1 first locus (=eb) */
-                for(int i=0;i<K;i++){
-                    int g=gb[i], g2=gb2[i];
-                    double a_l=GFr[g]+PFr[g]*ent[i];
-                    double a_lp1=GF2[g2]+PF2[g2]*ent2[i];
-                    ccpop[pop_vec[i]] += a_lp1*cx2[i]*KF1 - a_l*cx2[i]*KF*EM(l+1,i)*om;
-                }
+            } else if(b+1<nb){   /* L2 boundary JOIN-FOLD over (g_b,g_{b+1},pop) cells.
+                   Identity: ent2(i)=AENTRY[b+1](i)=a_l(i), so a_lp1=GF2[g2]+PF2[g2]*a_l with
+                   a_l=GFr[g]+PFr[g]*ent. incr(i)=cx2*(cf0 + cf1*ent) folds bilinearly:
+                   one O(K) moment scatter (Mc=sum cx2, Mce=sum cx2*ent) + O(cells*npop) combine. */
+                int co=Gr->celloff[b], nc=Gr->celloff[b+1]-co; int *cidB=Gr->cellB+(size_t)b*K;
+                double *cx2=CEXIT+(size_t)(b+1)*K;
+                double *GF2=GF+off[b+1], *PF2=PF+off[b+1], *Eg2=Eg+off[b+1];  /* block b+1 row 0 */
+                for(int x=0;x<nc*npop;x++){ Mc[x]=0.0; Mce[x]=0.0; }
+                for(int i=0;i<K;i++){ int c=cidB[i], p=pop_vec[i]; double cv=cx2[i];
+                    Mc[c*npop+p]+=cv; Mce[c*npop+p]+=cv*ent[i]; }
+                int *cGb=Gr->cellGb+co, *cG2=Gr->cellG2+co;
+                for(int c=0;c<nc;c++){ int g=cGb[c], g2=cG2[c];
+                    double C0=KF1*GF2[g2], C1=KF1*PF2[g2]-KF*om*Eg2[g2];
+                    double cf0=C0+C1*GFr[g], cf1=C1*PFr[g]; int base=c*npop;
+                    for(int p=0;p<npop;p++) ccpop[p]+= cf0*Mc[base+p]+cf1*Mce[base+p]; }
             }
             { double *t; t=GBp;GBp=GBc;GBc=t; t=PBp;PBp=PBc;PBc=t; }   /* GBp now = GB[l] */
         }
@@ -297,7 +339,7 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
 
     free(off);free(GF);free(PF);free(Eg);free(AENTRY);free(WB);free(CEXIT);free(As);free(Bs);
     free(SentS);free(SwS);free(G);free(P);free(GBp);free(PBp);free(GBc);free(PBc);
-    free(szP);free(SaP);free(SwP);free(SawP);free(aprev);free(cexit);
+    free(szP);free(SaP);free(SwP);free(SawP);free(aprev);free(cexit);free(Mc);free(Mce);
     return 0;
 }
 
