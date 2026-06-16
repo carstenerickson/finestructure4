@@ -112,17 +112,26 @@ cmp_set "$TMP/d_a" "$TMP/f_a" "fold == dense   [-a 0 0]"
 # --- output suppression: -fold must NOT write the regional bootstrap files (a
 #     zero-filled .regionsquaredchunkcounts.out would collapse chromocombine's c)
 #     and must REJECT the per-locus -b/-d outputs it cannot produce. ---
-echo "=== -fold output suppression ==="
+echo "=== -fold output suppression + per-locus outputs ==="
+# regional bootstrap genuinely cannot be folded -> the files must be ABSENT.
 env OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" -t "$ID" -f "$POP" 0 0 \
     -s 0 -i 0 -k 5 -n "$NE" -M "$MUT" -fold -o "$TMP/sup" >/dev/null 2>&1
 if [ -f "$TMP/sup.regionchunkcounts.out" ] || [ -f "$TMP/sup.regionsquaredchunkcounts.out" ]; then
   echo "  FAIL  regional files present under -fold"; fail=1
 else echo "  PASS  regional files absent under -fold"; fi
-for fl in -b -d; do
-  if env OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" -t "$ID" -f "$POP" 0 0 \
-      -s 0 -i 0 $fl -fold -n "$NE" -M "$MUT" -o "$TMP/rej" >/dev/null 2>&1; then
-    echo "  FAIL  $fl accepted under -fold"; fail=1
-  else echo "  PASS  $fl rejected under -fold"; fi
+# -b (.copyprobsperlocus, per-locus per-pop copy posterior) and -d (.transitionprobs,
+# per-locus transition prob) ARE produced by the fold, byte-identical to the dense.
+gzcmp() { # ext label  (compares <prefix>.ext.gz under $TMP/bd_d vs $TMP/bd_f)
+  if diff <(gunzip -c "$TMP/bd_d.$1" 2>/dev/null) <(gunzip -c "$TMP/bd_f.$1" 2>/dev/null) >/dev/null 2>&1
+  then echo "  PASS  $2"; else echo "  FAIL  $2"; fail=1; fi
+}
+for mode in "-i 0" "-i 6 -in -iM"; do
+  env OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" -t "$ID" -f "$POP" 0 0 \
+      -s 0 $mode -n "$NE" -M "$MUT" -b -d       -o "$TMP/bd_d" >/dev/null 2>&1
+  env OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" -t "$ID" -f "$POP" 0 0 \
+      -s 0 $mode -n "$NE" -M "$MUT" -b -d -fold -o "$TMP/bd_f" >/dev/null 2>&1
+  gzcmp copyprobsperlocus.out.gz "fold -b == dense   [$mode]"
+  gzcmp transitionprobs.out.gz   "fold -d == dense   [$mode]"
 done
 
 # --- independent oracle: fs (dense AND fold) vs a from-scratch reference that

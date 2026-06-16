@@ -593,19 +593,15 @@ int chromopainter(int argc, char *argv[])
   fprintf(Par->out,"Assigning parameters from command line\n");
   assignParameters(Par,Infiles,Outfiles,argc,argv);
 
-  /* -fold cannot produce the per-region / per-locus outputs (the block fold
-     dissolves the per-region bootstrap and the per-locus copy structure). Suppress
-     the default-on regional files so they are ABSENT rather than written as zeros
-     (a zero .regionsquaredchunkcounts.out silently collapses chromocombine's c
-     estimate), and reject the explicitly-requested -b/-d outputs with a clear
-     error. Done before openOutfiles so the files are never created. */
+  /* -fold cannot produce the per-region BOOTSTRAP (it needs per-region resampling
+     the block fold dissolves). Suppress the default-on regional files so they are
+     ABSENT rather than written as zeros (a zero .regionsquaredchunkcounts.out
+     silently collapses chromocombine's c estimate). The per-locus -b/-d outputs
+     ARE produced by the fold (per-pop copy posterior + per-locus transition prob).
+     Done before openOutfiles so the regional files are never created. */
   if(Par->use_fold){
     Outfiles->usingFile[6]=0;   /* .regionchunkcounts.out */
     Outfiles->usingFile[7]=0;   /* .regionsquaredchunkcounts.out */
-    if(Par->print_file9_ind || Par->printnorecprobs){
-      fprintf(Par->out,"ERROR: -fold cannot produce the per-locus outputs -b (.copyprobsperlocus.out) or -d (.transitionprobs.out); the block fold collapses the per-locus copy structure. Drop -b/-d, or use the dense painter. Exiting...\n");
-      stop_on_error(1,Par->errormode,Par->err);
-    }
   }
 
   if(Par->vverbose) fprintf(Par->out,"Opening output files\n");

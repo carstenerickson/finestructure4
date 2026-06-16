@@ -119,7 +119,9 @@ static Groups build_groups_adaptive(int Ustar, int bypop){
 
 /* FOLDED forward+backward+chunkcount -> per-pop chunk counts (ccpop[npop]).
    Direct port of cpfold.c fold_cc; rh = the recipient allele row. */
-static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nlen, double *Ne_out, double *loglik_out, Groups *Gr){
+/* etp_out[N-1] (per-locus transition prob, for -d) and ecp_out[N*npop] (per-locus
+   per-pop copy posterior, for -b) are optional: filled only when non-NULL. */
+static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nlen, double *Ne_out, double *loglik_out, double *etp_out, double *ecp_out, Groups *Gr){
     #define EM(L,II) cp_emis(rh[(L)], donors[(size_t)(L)*K+(II)], cf_mut[(II)])
     int nb=Gr->nb, Umax=Gr->Umax; Block *blk=Gr->blk; int *gidB=Gr->gidB;
     int *sizeg=Gr->sizeg, *repg=Gr->repg;
@@ -178,7 +180,9 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
     double tot_prob_Ne=0.0, tot_gd=0.0;
     for(int p=0;p<npop;p++){ ndiff[p]=0.0; nlen[p]=0.0; }
     { double S_end=exp(As[N-2]-Asf);   /* last locus N-1: c=1, a[N-1]=aprev (post-forward) */
-      for(int i=0;i<K;i++) if(rh[N-1]!=donors[(size_t)(N-1)*K+i]) ndiff[pop_vec[i]]+=aprev[i]*S_end; }
+      for(int i=0;i<K;i++){ double am=aprev[i]*S_end;   /* = e_a_l_bc at l=N-1 (copy posterior) */
+        if(rh[N-1]!=donors[(size_t)(N-1)*K+i]) ndiff[pop_vec[i]]+=am;
+        if(ecp_out) ecp_out[(size_t)(N-1)*npop+pop_vec[i]]+=am; } }
     double *cexit=malloc(sizeof(double)*K); for(int i=0;i<K;i++) cexit[i]=1.0;
     { double sb0=0.0; for(int i=0;i<K;i++) sb0+=T[N-2]*cf_cp[i]*EM(N-1,i); Bs[N-1]=log(sb0); }
     for(int b=nb-1;b>=0;b--){
@@ -241,15 +245,18 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *ndiff, double *nle
                zero - including them would divide by zero. Matches the dense guard. */
             if(lam_g[l]>=0){ double gd=(pos_g[l+1]-pos_g[l])*delta_g*lam_g[l];
                 if(gd>0.0){ tot_gd+=gd; tot_prob_Ne+=(rho_g*gd/(1.0-exp(-rho_g*gd)))*etpl; } }
+            if(etp_out) etp_out[l]=etpl;   /* per-locus transition prob (for -d), l in 0..N-2 */
             /* per-pop expected_differences (e_a_l_bc=a_l*c_l*KC, mismatched donors) +
-               the e_a_l_bc half of expected_chunk_length (all donors). CURRENT GBc/PBc. */
+               the e_a_l_bc half of expected_chunk_length (all donors). CURRENT GBc/PBc.
+               Summed over groups per pop, e_a_l_bc is the -b copy posterior at this locus. */
             { double KC=exp(Asm1+Bs[l+1]-Asf); int *rp=repg+(size_t)b*Umax;
               for(int g=0;g<U;g++){
                 double gA=GFr[g],pA=PFr[g],gB=GBc[g],pB=PBc[g]; int base=g*npop;
                 int mm = (rh[l]!=donors[(size_t)l*K+rp[g]]);
                 for(int p=0;p<npop;p++){ double sz_=szP[base+p];
                     double albc=KC*(gA*gB*sz_ + gA*pB*SwP[base+p] + pA*gB*SaP[base+p] + pA*pB*SawP[base+p]);
-                    nlen[p]+=Glh*albc; if(mm) ndiff[p]+=albc; } } }
+                    nlen[p]+=Glh*albc; if(mm) ndiff[p]+=albc;
+                    if(ecp_out) ecp_out[(size_t)l*npop+p]+=albc; } } }
             { double *t; t=GBp;GBp=GBc;GBc=t; t=PBp;PBp=PBc;PBc=t; }
         }
         double *cxb=CEXIT+(size_t)b*K;
@@ -276,7 +283,7 @@ void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
                    double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
                    double *out_ccpop, double *out_ndiff, double *out_nlen, double *out_Ne,
-                   double *out_loglik, double *t_build, double *t_fold){
+                   double *out_loglik, double *out_etp, double *out_ecp, double *t_build, double *t_fold){
     K=nhaps; N=nloci; npop=ndonorpops;
     cf_cp=copy_prob; cf_cps=copy_probSTART; cf_mut=MutProb_vec;
     pop_vec=pop_vec_in; T=TransProb;
@@ -295,7 +302,7 @@ void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
     *t_build=cf_now()-tb0;
 
     double tf0=cf_now();
-    fold_cc(rh, out_ccpop, out_ndiff, out_nlen, out_Ne, out_loglik, &Gr);
+    fold_cc(rh, out_ccpop, out_ndiff, out_nlen, out_Ne, out_loglik, out_etp, out_ecp, &Gr);
     *t_fold=cf_now()-tf0;
 
     free_groups(&Gr); free(donors); free(rh);

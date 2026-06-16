@@ -603,13 +603,26 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
     int *cntp=calloc(ndonorpops,sizeof(int));
     for(i=0;i<*p_Nhaps;i++) cntp[pop_vec[i]]++;
     double tb=0,tf=0,foldloglik=0.0;
+    /* -d (.transitionprobs, per-locus transition prob) and -b (.copyprobsperlocus,
+       per-locus per-pop copy posterior) are computed natively by the fold; fill them
+       only on the final run when the file is requested (NULL otherwise => skipped). */
+    double *etp_out = (finalrun && Outfiles->usingFile[9]) ? calloc((size_t)*p_Nloci, sizeof(double)) : NULL;
+    double *ecp_out = (finalrun && Outfiles->usingFile[8]) ? calloc((size_t)*p_Nloci*ndonorpops, sizeof(double)) : NULL;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
                   copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops,
-                  Par->fold_ustar, fpp, fdiff, flen, &N_e_new, &foldloglik, &tb, &tf);
+                  Par->fold_ustar, fpp, fdiff, flen, &N_e_new, &foldloglik, etp_out, ecp_out, &tb, &tf);
     Alphasum = foldloglik;
     /* write the forward log-likelihood to .EMprobs.out, same column the dense
        writes at the matching point (keeps the EMPAR row layout identical). */
     if(Outfiles->usingFile[2]) fprintf(Outfiles->fout3," %.10lf",foldloglik);
+    /* -d / -b per-locus rows, via the same print functions and the same locus order
+       the dense uses (transitionprobs in genomic order; copyprobsperlocus from the
+       last locus down to the first). The per-recipient HAP header line is already
+       written in the common EM-driver path. */
+    if(etp_out){ printTransitionProb(etp_out, ind_val, *p_Nloci, Outfiles); free(etp_out); }
+    if(ecp_out){ printCopyProbs(&ecp_out[(size_t)(*p_Nloci-1)*ndonorpops], ind_val, pos[*p_Nloci-1], Outfiles, Par);
+                 for(int l=*p_Nloci-2; l>=0; l--) printCopyProbs(&ecp_out[(size_t)l*ndonorpops], ind_val, pos[l], Outfiles, Par);
+                 free(ecp_out); }
     /* per-pop totals are exact; distributed uniformly within each donor pop so
        total_counts / total_differences / total_lengths are reproduced. */
     for(i=0;i<*p_Nhaps;i++){ int p=pop_vec[i];
@@ -648,7 +661,7 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
     double t_build=0, t_fold=0, Ne_fold=0, ll_fold=0;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
                   copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops, Ustar,
-                  ccfold, cdfold, clfold, &Ne_fold, &ll_fold, &t_build, &t_fold);
+                  ccfold, cdfold, clfold, &Ne_fold, &ll_fold, NULL, NULL, &t_build, &t_fold);
     double mre=0,mrd=0,mrl=0; for(int p=0;p<ndonorpops;p++){
       double e=fabs(ccfold[p]-ccdense[p])/(fabs(ccdense[p])+1e-300); if(e>mre)mre=e;
       double d=fabs(cdfold[p]-cddense[p])/(fabs(cddense[p])+1e-300); if(d>mrd)mrd=d;
