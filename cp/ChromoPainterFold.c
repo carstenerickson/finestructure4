@@ -47,6 +47,9 @@ typedef struct {
     int *gidB;
     int *sizeg,*repg,*popg;
     int *cellB, *celloff, *cellGb, *cellG2, maxcell;
+    int *gperm, *goff;   /* group->donor CSR per block (for -fold sampling): the donors
+                            of block b's group g are gperm[b*K + goff[b*(Umax+1)+g] ..
+                            goff[b*(Umax+1)+g+1]). Built once (panel-fixed). */
 } Groups;
 
 /* panel-fixed (g_b,g_{b+1}) contingency for the L2 boundary join-fold */
@@ -73,7 +76,8 @@ static void build_contingency(Groups *G){
     free(cmap); free(cstamp);
 }
 static void free_groups(Groups *G){ free(G->blk);free(G->gidB);free(G->sizeg);free(G->repg);free(G->popg);
-    free(G->cellB);free(G->celloff);free(G->cellGb);free(G->cellG2); }
+    free(G->cellB);free(G->celloff);free(G->cellGb);free(G->cellG2);
+    free(G->gperm);free(G->goff); }
 
 /* PBWT adaptive variable-length blocks: grow each block by incrementally
    splitting the substring grouping column-by-column; cut when U reaches Ustar.
@@ -115,6 +119,14 @@ static Groups build_groups_adaptive(int Ustar, int bypop){
         for(int g=0;g<Ub;g++){sz[g]=0;rp[g]=-1;}
         for(int i=0;i<K;i++){int g=gb[i];sz[g]++; if(rp[g]<0)rp[g]=i;}
     }
+    /* group->donor CSR (gperm/goff), panel-fixed, for the -fold path sampler. */
+    G.goff=malloc(sizeof(int)*(size_t)G.nb*(Umax+1)); G.gperm=malloc(sizeof(int)*(size_t)G.nb*K);
+    { int *cur=malloc(sizeof(int)*(Umax+1));
+      for(int bb=0;bb<G.nb;bb++){ int Ub=G.blk[bb].U; int *gb=gidB+(size_t)bb*K;
+        int *sz=G.sizeg+(size_t)bb*Umax, *go=G.goff+(size_t)bb*(Umax+1), *gp=G.gperm+(size_t)bb*K;
+        go[0]=0; for(int g=0;g<Ub;g++){ go[g+1]=go[g]+sz[g]; cur[g]=go[g]; }
+        for(int i=0;i<K;i++){ int g=gb[i]; gp[cur[g]++]=i; } }
+      free(cur); }
     build_contingency(&G);
     return G;
 }
@@ -123,7 +135,31 @@ static Groups build_groups_adaptive(int Ustar, int bypop){
    Direct port of cpfold.c fold_cc; rh = the recipient allele row. */
 /* etp_out[N-1] (per-locus transition prob, for -d) and ecp_out[N*npop] (per-locus
    per-pop copy posterior, for -b) are optional: filled only when non-NULL. */
-static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *ndiff, double *nlen, double *Ne_out, double *loglik_out, double *etp_out, double *ecp_out, Groups *Gr){
+/* Sample one donor ~ rescaled forward a[l][.] WITHOUT materializing the length-K
+   vector: draw a group g prop to (size_g*GF + PF*Sentry_g), then a donor within g
+   prop to (GF + PF*a_entry(i)) over that group's members (gperm/goff CSR). gw is a
+   >=Umax scratch buffer. Uses the global rand() (seeded by -S). */
+static int fold_sample_donor(int l, Groups *Gr, const double *GF, const double *PF,
+                             const double *AENTRY, const double *SentS, const size_t *off,
+                             const int *locblk, double *gw){
+    int Umax=Gr->Umax, b=locblk[l], sb=Gr->blk[b].s, U=Gr->blk[b].U;
+    const double *GFr=GF+off[b]+(size_t)(l-sb)*U, *PFr=PF+off[b]+(size_t)(l-sb)*U;
+    const double *ent=AENTRY+(size_t)b*K, *Sx=SentS+(size_t)b*Umax;
+    const int *sz=Gr->sizeg+(size_t)b*Umax, *go=Gr->goff+(size_t)b*(Umax+1), *gp=Gr->gperm+(size_t)b*K;
+    double gtot=0.0;
+    for(int g=0;g<U;g++){ double m=sz[g]*GFr[g]+PFr[g]*Sx[g]; if(m<0.0)m=0.0; gw[g]=m; gtot+=m; }
+    double u=((double)rand()/RAND_MAX)*gtot, c=0.0; int g=0;
+    for(g=0;g<U;g++){ c+=gw[g]; if(u<=c) break; } if(g>=U) g=U-1;
+    int lo=go[g], hi=go[g+1]; double dtot=0.0;
+    for(int t=lo;t<hi;t++){ double m=GFr[g]+PFr[g]*ent[gp[t]]; if(m>0.0)dtot+=m; }
+    double u2=((double)rand()/RAND_MAX)*dtot, c2=0.0; int sel=gp[hi-1];
+    for(int t=lo;t<hi;t++){ double m=GFr[g]+PFr[g]*ent[gp[t]]; if(m>0.0)c2+=m; if(u2<=c2){ sel=gp[t]; break; } }
+    return sel;
+}
+
+/* samplesTOT>0 + sout!=NULL: also draw samplesTOT copying paths (hierarchical FFBS
+   over the affine forward, no full Alphamat) into sout[s*N+l] = donor index. */
+static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *ndiff, double *nlen, double *Ne_out, double *loglik_out, double *etp_out, double *ecp_out, int samplesTOT, int *sout, Groups *Gr){
     #define EM(L,II) cp_emis(rh[(L)], donors[(size_t)(L)*K+(II)], cf_mut[(II)])
     int nb=Gr->nb, Umax=Gr->Umax; Block *blk=Gr->blk; int *gidB=Gr->gidB;
     int *sizeg=Gr->sizeg, *repg=Gr->repg;
@@ -143,6 +179,7 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *
     double *szP=malloc((size_t)Umax*npop*sizeof(double)), *SaP=malloc((size_t)Umax*npop*sizeof(double));
     double *SwP=malloc((size_t)Umax*npop*sizeof(double)), *SawP=malloc((size_t)Umax*npop*sizeof(double));
     double *Mc=malloc((size_t)Gr->maxcell*npop*sizeof(double)), *Mce=malloc((size_t)Gr->maxcell*npop*sizeof(double));
+    double *sumA_arr = (samplesTOT>0 && sout) ? malloc(sizeof(double)*N) : NULL;  /* rescaled forward sum S~[l], for sampling */
 
     for(int b=0;b<nb;b++){ int sb=blk[b].s,eb=blk[b].e,U=blk[b].U; int *rp=repg+(size_t)b*Umax;
         double *base=Eg+off[b]; double *cpg=CPG+(size_t)b*Umax, *cpsg=CPSG+(size_t)b*Umax;
@@ -168,10 +205,36 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *
                 else { double fac=eg*(1-T[l-1])*rlm1; gv=eg*cpg[g]+fac*G[g]; pv=fac*P[g]; }
                 G[g]=gv; P[g]=pv; GFr[g]=gv; PFr[g]=pv; sumA += sz[g]*gv + pv*Sx[g];
             }
+            if(sumA_arr) sumA_arr[l]=sumA;
             double s=(l<N-1)?sumA*T[l]:sumA; As[l]=(l>=1?As[l-1]:0.0)+log(s);
         }
         double *GFl=GFb+(size_t)(eb-1-sb)*U, *PFl=PFb+(size_t)(eb-1-sb)*U;
         for(int i=0;i<K;i++){ int g=gb[i]; aprev[i]=GFl[g]+PFl[g]*ent[i]; }
+    }
+
+    /* ---- -fold path sampling: hierarchical FFBS over the affine forward ----
+       For each path, sample the donor at N-1 ~ a[N-1][.], then walk backward: stay on
+       the current donor j with prob (1-T)*a[l][j] / ((1-T)*a[l][j] + T*copy_prob[j]*S~[l])
+       (no recombination), else resample i ~ a[l][.] (recombination). All quantities use
+       the rescaled forward; the per-locus rescale cancels in both ratios. */
+    if(samplesTOT>0 && sout){
+        int *locblk=malloc(sizeof(int)*N);
+        for(int b=0;b<nb;b++) for(int l=blk[b].s;l<blk[b].e;l++) locblk[l]=b;
+        double *gw=malloc(sizeof(double)*Umax);
+        for(int s=0;s<samplesTOT;s++){
+            int j=fold_sample_donor(N-1, Gr, GF, PF, AENTRY, SentS, off, locblk, gw);
+            sout[(size_t)s*N+(N-1)]=j;
+            for(int l=N-2;l>=0;l--){
+                int b=locblk[l], sb=blk[b].s, U=blk[b].U, gj=gidB[(size_t)b*K+j];
+                double a_lj=GF[off[b]+(size_t)(l-sb)*U+gj] + PF[off[b]+(size_t)(l-sb)*U+gj]*AENTRY[(size_t)b*K+j];
+                double w_norec=(1.0-T[l])*a_lj, w_rec=T[l]*cf_cp[j]*sumA_arr[l];
+                double u=(double)rand()/RAND_MAX; int i;
+                if(u*(w_norec+w_rec) < w_norec) i=j;   /* no recombination: copying continues */
+                else i=fold_sample_donor(l, Gr, GF, PF, AENTRY, SentS, off, locblk, gw);
+                sout[(size_t)s*N+l]=i; j=i;
+            }
+        }
+        free(locblk); free(gw);
     }
 
     double Asf=As[N-1];
@@ -279,6 +342,7 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *
     free(off);free(GF);free(PF);free(Eg);free(AENTRY);free(WB);free(CEXIT);free(As);free(Bs);
     free(SentS);free(SwS);free(G);free(P);free(GBp);free(PBp);free(GBc);free(PBc);
     free(szP);free(SaP);free(SwP);free(SawP);free(aprev);free(cexit);free(Mc);free(Mce);free(CPG);free(CPSG);
+    free(sumA_arr);
     #undef EM
 }
 
@@ -290,7 +354,8 @@ void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
                    double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
                    double *out_ccpop, double *out_start, double *out_ndiff, double *out_nlen, double *out_Ne,
-                   double *out_loglik, double *out_etp, double *out_ecp, double *t_build, double *t_fold){
+                   double *out_loglik, double *out_etp, double *out_ecp, int samplesTOT, int *out_samples,
+                   double *t_build, double *t_fold){
     K=nhaps; N=nloci; npop=ndonorpops;
     cf_cp=copy_prob; cf_cps=copy_probSTART; cf_mut=MutProb_vec;
     pop_vec=pop_vec_in; T=TransProb;
@@ -309,7 +374,7 @@ void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
     *t_build=cf_now()-tb0;
 
     double tf0=cf_now();
-    fold_cc(rh, out_ccpop, out_start, out_ndiff, out_nlen, out_Ne, out_loglik, out_etp, out_ecp, &Gr);
+    fold_cc(rh, out_ccpop, out_start, out_ndiff, out_nlen, out_Ne, out_loglik, out_etp, out_ecp, samplesTOT, out_samples, &Gr);
     *t_fold=cf_now()-tf0;
 
     free_groups(&Gr); free(donors); free(rh);

@@ -610,10 +610,20 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
        only on the final run when the file is requested (NULL otherwise => skipped). */
     double *etp_out = (finalrun && Outfiles->usingFile[9]) ? calloc((size_t)*p_Nloci, sizeof(double)) : NULL;
     double *ecp_out = (finalrun && Outfiles->usingFile[8]) ? calloc((size_t)*p_Nloci*ndonorpops, sizeof(double)) : NULL;
+    /* -s sampling: draw copying paths on the final run via the hierarchical fold
+       sampler. fsamp[s*Nloci+l] = sampled donor index. samples are distributionally
+       identical to the dense (not byte-identical: a different RNG draw sequence). */
+    int fsTOT = (finalrun && Outfiles->usingFile[0]) ? Par->samplesTOT : 0;
+    int *fsamp = (fsTOT>0) ? malloc((size_t)fsTOT*(*p_Nloci)*sizeof(int)) : NULL;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
                   copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops,
-                  Par->fold_ustar, fpp, fstart, fdiff, flen, &N_e_new, &foldloglik, etp_out, ecp_out, &tb, &tf);
+                  Par->fold_ustar, fpp, fstart, fdiff, flen, &N_e_new, &foldloglik, etp_out, ecp_out, fsTOT, fsamp, &tb, &tf);
     Alphasum = foldloglik;
+    /* write the sampled paths to .samples.out.gz (same format as the dense; the
+       per-recipient "HAP h+1 label" header line is written in the common driver). */
+    if(fsamp){ for(int s=0;s<fsTOT;s++){ gzprintf(*Outfiles->fout1,"%d",s+1);
+        for(int l=0;l<*p_Nloci;l++) gzprintf(*Outfiles->fout1," %d",cond_mat_haplotypes[fsamp[(size_t)s*(*p_Nloci)+l]]+1);
+        gzprintf(*Outfiles->fout1,"\n"); } free(fsamp); }
     /* write the forward log-likelihood to .EMprobs.out, same column the dense
        writes at the matching point (keeps the EMPAR row layout identical). */
     if(Outfiles->usingFile[2]) fprintf(Outfiles->fout3," %.10lf",foldloglik);
@@ -675,7 +685,7 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
     double t_build=0, t_fold=0, Ne_fold=0, ll_fold=0;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
                   copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops, Ustar,
-                  ccfold, NULL, cdfold, clfold, &Ne_fold, &ll_fold, NULL, NULL, &t_build, &t_fold);
+                  ccfold, NULL, cdfold, clfold, &Ne_fold, &ll_fold, NULL, NULL, 0, NULL, &t_build, &t_fold);
     double mre=0,mrd=0,mrl=0; for(int p=0;p<ndonorpops;p++){
       double e=fabs(ccfold[p]-ccdense[p])/(fabs(ccdense[p])+1e-300); if(e>mre)mre=e;
       double d=fabs(cdfold[p]-cddense[p])/(fabs(cddense[p])+1e-300); if(d>mrd)mrd=d;

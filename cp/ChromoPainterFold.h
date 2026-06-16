@@ -39,6 +39,7 @@ void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
                    double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
                    double *out_ccpop, double *out_start, double *out_ndiff, double *out_nlen, double *out_Ne,
-                   double *out_loglik, double *out_etp, double *out_ecp, double *t_build, double *t_fold);
+                   double *out_loglik, double *out_etp, double *out_ecp, int samplesTOT, int *out_samples,
+                   double *t_build, double *t_fold);
 
 #endif

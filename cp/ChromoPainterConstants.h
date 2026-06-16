@@ -20,7 +20,7 @@ extern "C" {
        -p  specify to use prior copying probabilities in donor list file\n\
        -m <double>  specify to use mutation (emission) probabilities in donor list file (and provide self-copying mutation rate\n\
        -M <double>  global mutation (emission) probability (default=Li & Stephen's (2003) fixed estimate)\n\
-       -fold  use the exact O(N*Umean) block-fold engine for the chunk counts (chunkcounts/chunklengths/mutationprobs/copyprobsperlocus/transitionprobs, plus -in N_e and -iM global-mutation E-M). Output matches the dense painter to printed precision. Requires -s 0; incompatible with -ip/-im/-u; regional bootstrap outputs are not produced.\n\
+       -fold  use the exact O(N*Umean) block-fold engine for the chunk counts (chunkcounts/chunklengths/mutationprobs/copyprobsperlocus/transitionprobs, plus the -ip/-im/-in/-iM E-M updates and path sampling -s). Output matches the dense painter to printed precision (samples are distributionally identical, not byte-identical); incompatible with -u; regional bootstrap outputs are not produced.\n\
        -foldU <int>  target number of local-substring groups per block for -fold (default=24; larger trades memory for fewer blocks). Implies -fold.\n\
        -k <double>  specify number of expected chunks to define a 'region' (default=100)\n\
        -j  specify that individuals are haploid\n\

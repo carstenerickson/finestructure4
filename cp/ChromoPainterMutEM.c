@@ -483,14 +483,16 @@ void printInformation(struct files_t *Outfiles,struct infiles_t *Infiles,struct 
          posterior chunk count + start term), -im (per-pop mutation, via the per-pop
          expected differences), -in (N_e) and -iM (global mutation). The per-pop
          MutProb that -im produces is constant within each (substring,pop) group, so
-         the next iteration folds exactly too. It is incompatible only with the modes
-         that need the Alphamat (sampling, -s >0) or drop linkage (-u). */
-      if (Par->samplesTOT>0 || Par->unlinked_ind)
+         the next iteration folds exactly too. Path sampling (-s >0) is supported via
+         a hierarchical sampler over the affine forward (samples are distributionally
+         identical to the dense, not byte-identical). It is incompatible only with -u
+         (unlinked), which has no copying-path structure to fold. */
+      if (Par->unlinked_ind)
         {
-          fprintf(Par->out,"ERROR: -fold (exact block-fold) produces chunk counts only (no samples). It supports uniform or FIXED per-population copy probabilities (-p) and mutation rates (-m), plus the per-population E-M updates -ip (copy proportions), -im (per-pop mutation), -in (N_e) and -iM (global mutation), but is incompatible with -u (unlinked) and -s >0 (sampling). Exiting...\n");
+          fprintf(Par->out,"ERROR: -fold (exact block-fold) supports uniform or FIXED per-population copy probabilities (-p) and mutation rates (-m), the per-population E-M updates -ip/-im/-in/-iM, and path sampling (-s), but is incompatible with -u (unlinked). Exiting...\n");
           stop_on_error(1,Par->errormode,Par->err);
         }
-      fprintf(Par->out,"Using exact block-fold (-fold, Ustar=%d): chunk counts, chunk lengths, mutation probs + -ip/-im/-in/-iM E-M (all exact); regional bootstrap outputs are NOT produced.\n",Par->fold_ustar);
+      fprintf(Par->out,"Using exact block-fold (-fold, Ustar=%d): chunk counts, chunk lengths, mutation probs + -ip/-im/-in/-iM E-M + path sampling (all exact / distributionally exact); regional bootstrap outputs are NOT produced.\n",Par->fold_ustar);
     }
   if (Par->copy_prop_em_find==1)
     fprintf(Par->out,"Running E-M to estimate copying proportions....\n");

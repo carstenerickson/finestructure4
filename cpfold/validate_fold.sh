@@ -169,6 +169,32 @@ if [ -f "$OD/data.phase" ]; then
   orun "CPLOG=1" ""      "$TMP/odlog"; ocheck "$TMP/odlog.chunkcounts.out" "log-dense  == oracle" || fail=1
   orun ""        ""      "$TMP/odlin"; ocheck "$TMP/odlin.chunkcounts.out" "lin-dense  == oracle" || fail=1
   orun ""        "-fold" "$TMP/ofold"; ocheck "$TMP/ofold.chunkcounts.out" "fold       == oracle" || fail=1
+
+  # -fold PATH SAMPLING (-s): the hierarchical sampler draws copying paths from the
+  # affine forward (no Alphamat). Samples are distributionally - not byte - identical
+  # to the dense, so validate statistically: the empirical per-locus popA copy
+  # frequency from many samples must converge to the exact analytic posterior (the
+  # -fold -b output). Tested single-block (-fold) and multi-block (-foldU 2). popA
+  # donor output values for this case are {2,3}; loci at pos 100..1600.
+  echo "=== -fold path sampling draws from the correct posterior (oracle) ==="
+  orun "" "-fold -b" "$TMP/osb"
+  gunzip -c "$TMP/osb.copyprobsperlocus.out.gz" > "$TMP/oanl.txt" 2>/dev/null
+  sampcheck() { # foldargs label
+    env OMP_NUM_THREADS=1 "$FS" cp -g "$OD/data.phase" -r "$OD/data.recom" -t "$OD/id.txt" \
+        -f "$OD/poplist.txt" 0 0 -j -s 100000 -S 9 -i 0 -n 100 -M 0.01 $1 -o "$TMP/osamp" >/dev/null 2>&1
+    gunzip -c "$TMP/osamp.samples.out.gz" > "$TMP/osamp.txt" 2>/dev/null
+    awk -v lab="$2" '
+      function abs(x){return x<0?-x:x}
+      FNR==NR{ if($1+0>0 && $0 !~ /[A-Za-z]/) anl[$1]=$2; next }   # analytic: pos -> popA posterior
+      /^[0-9]+ / && NF==7 { n++; pp[1]=100;pp[2]=200;pp[3]=400;pp[4]=700;pp[5]=1100;pp[6]=1600;
+        for(l=1;l<=6;l++){ d=$(l+1); if(d==2||d==3) cnt[l]++ } }
+      END{ if(n==0){print "  FAIL  "lab" (no samples)"; exit 1}
+        mx=0; for(l=1;l<=6;l++){ e=cnt[l]/n; dd=abs(e-anl[pp[l]]); if(dd>mx)mx=dd }
+        if(mx<0.03) printf "  PASS  %s (max|emp-analytic popA|=%.4f, n=%d)\n",lab,mx,n;
+        else { printf "  FAIL  %s (max diff %.4f)\n",lab,mx; exit 1 } }' "$TMP/oanl.txt" "$TMP/osamp.txt"
+  }
+  sampcheck "-fold"    "fold sampling ~ posterior   [1 block]"     || fail=1
+  sampcheck "-foldU 2" "fold sampling ~ posterior   [multi-block]" || fail=1
 fi
 
 # --- path-sampling consistency (PR1): the linear-space default must produce the
