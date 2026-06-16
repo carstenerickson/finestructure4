@@ -113,13 +113,14 @@ static Groups build_groups(int B){
     int *htgid=malloc(sizeof(int)*cap), *htstamp=calloc(cap,sizeof(int));
     /* first pass: gid assignment + Umax + per-block U */
     int *Ublk=malloc(sizeof(int)*nb), Umax=0, *repTmp=malloc(sizeof(int)*K), gen=0;
-    uint64_t key[16];
+    uint64_t *key=malloc((size_t)W*sizeof(uint64_t));   /* W=ceil(2B/64) words; dynamic (B may exceed 512) */
     for(int b=0;b<nb;b++){
         int sb=G.blk[b].s, eb=G.blk[b].e; int *gb=G.gidB+(size_t)b*K; gen++;
         int U=0;
         for(int i=0;i<K;i++){
             for(int w=0;w<W;w++) key[w]=0;
-            for(int l=sb;l<eb;l++){ int bp=2*(l-sb); key[bp>>6]|=(uint64_t)(donors[(size_t)l*K+i]&3)<<(bp&63); }
+            for(int l=sb;l<eb;l++){ int bp=2*(l-sb); int al=donors[(size_t)l*K+i]; int code=al<2?al:(al==8?2:3);
+                key[bp>>6]|=(uint64_t)code<<(bp&63); }  /* 4-way code: 0,1,8,9 -> 0,1,2,3 (keep missing alleles DISTINCT) */
             uint64_t h=1469598103934665603ULL; for(int w=0;w<W;w++) h=(h^key[w])*1099511628211ULL;
             int slot=h&(cap-1);
             for(;;){
@@ -139,7 +140,7 @@ static Groups build_groups(int B){
         for(int g=0;g<U;g++){sz[g]=0;rp[g]=-1;}
         for(int i=0;i<K;i++){int g=gb[i];sz[g]++; if(rp[g]<0){rp[g]=i;pg[g]=pop_vec[i];}}
     }
-    free(htkey);free(htgid);free(htstamp);free(Ublk);free(repTmp);
+    free(htkey);free(htgid);free(htstamp);free(Ublk);free(repTmp);free(key);
     return G;
 }
 static void free_groups(Groups *G){ free(G->blk);free(G->gidB);free(G->sizeg);free(G->repg);free(G->popg); }
@@ -154,7 +155,7 @@ static Groups build_groups_adaptive(int Ustar){
     Groups G; G.B=Ustar; G.nb=0;
     int cap_blk=64; G.blk=malloc(sizeof(Block)*cap_blk); int *gidB=NULL;
     int *gid=malloc(sizeof(int)*K), *ng=malloc(sizeof(int)*K);
-    int mapsz=(Ustar+8)*4; if(mapsz<16) mapsz=16;
+    int mapsz=(Ustar+8)*4; if(mapsz<256) mapsz=256;  /* U can transiently reach ~16 (forced no-cut at b=a+1) -> ek up to 63; floor 256 for margin */
     int *mp=malloc(sizeof(int)*mapsz), *mstamp=calloc(mapsz,sizeof(int)); int gen=0, Umax=0;
     int a=0; for(int i=0;i<K;i++) gid[i]=0; int U=1; int b=0;
     while(b<N){
@@ -303,6 +304,7 @@ static double fold_cc(int rr, double *ccpop /*[npop], zeroed by caller*/, Groups
 int main(int argc, char**argv){
     if(argc<3){ fprintf(stderr,"usage: %s cdata.bin blocksize|Ustar [reps] [ad]\n",argv[0]); return 1; }
     int B = atoi(argv[2]);
+    int adaptive = (argc>4 && strcmp(argv[4],"ad")==0); /* arg5=="ad" -> PBWT adaptive blocks, B used as Ustar */
     FILE *f=fopen(argv[1],"rb"); if(!f){perror("open");return 1;}
     int hdr[4]; fread(hdr,sizeof(int),4,f); K=hdr[0];N=hdr[1];npop=hdr[2];nrecip=hdr[3];
     double par[3]; fread(par,sizeof(double),3,f); rhobar=par[0];mut=par[1];copyprob=par[2];
@@ -316,6 +318,9 @@ int main(int argc, char**argv){
     pop_vec=malloc(sizeof(int)*K); fread(pop_vec,sizeof(int),K,f);
     ref_cc=malloc(sizeof(double)*npop); fread(ref_cc,sizeof(double),npop,f);
     fclose(f);
+    if(npop>16){ fprintf(stderr,"npop=%d exceeds the 16-slot per-pop arrays\n",npop); return 1; }
+    if(N<2){ fprintf(stderr,"need N>=2 SNPs\n"); return 1; }
+    if(!adaptive && B<2){ fprintf(stderr,"fixed blocksize must be >=2 (got %d); use adaptive mode for small Ustar\n",B); return 1; }
     T=malloc(sizeof(double)*(N-1));
     for(int l=0;l<N-1;l++) T[l]=1.0-exp(-(pos[l+1]-pos[l])*rhobar*lam[l]);
 
@@ -324,7 +329,6 @@ int main(int argc, char**argv){
     double *As=malloc(sizeof(double)*N), *Bs=malloc(sizeof(double)*N), *cc=malloc(sizeof(double)*K);
     double dense_pp[16]={0}, fold_pp_tot[16]={0};
     int reps = (argc>3)? atoi(argv[3]) : 7;       /* repeat timing, take MIN (denoise) */
-    int adaptive = (argc>4 && strcmp(argv[4],"ad")==0); /* arg5=="ad" -> PBWT adaptive blocks, B used as Ustar */
 
     Groups G = adaptive ? build_groups_adaptive(B) : build_groups(B);  /* (timed below; here for the correctness pass) */
     { long sumU=0, slots=0; int Ufold=0; for(int b=0;b<G.nb;b++){ sumU+=G.blk[b].U; slots+=(long)(G.blk[b].e-G.blk[b].s)*G.blk[b].U; if(G.blk[b].U>Ufold)Ufold=G.blk[b].U; }
