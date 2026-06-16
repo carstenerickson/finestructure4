@@ -9,6 +9,14 @@
 #define MIN_NE 1e-8
 #define SMALL_NUM 1e-20
 
+/* emission e(recipient allele r, donor allele d, donor mut m) - matches the
+   inline emission in forwardAlgorithm/backwardAlgorithm exactly. */
+static inline double cp_emis(int r, int d, double m){
+  if(r==9) return 1.0;
+  if(r==8) return (r==d)?(1-SMALL_NUM):SMALL_NUM;
+  return (r==d)?(1-m):m;
+}
+
 ///////////////////////////////////////
 ///////////////////////////////////////
 // Sampler
@@ -361,6 +369,134 @@ void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,
 }
 
 ///////////////////////////////////////////////
+// LINEAR-SPACE forward+backward (linear per-locus-rescaled alpha/beta).
+// Reproduces every output of forwardAlgorithm+backwardAlgorithm to FP, but does
+// O(N) transcendentals instead of O(N*K): alpha/beta are kept in LINEAR space
+// (Alphamat[l][i]=true forward; c[l][i]=rescaled backward), with only one exp +
+// one log PER LOCUS. The three per-locus scalars (KF1,KF,KC), the c recurrence
+// and the rescaling convention were derived and numerically verified (workflow
+// w51kwighz, all outputs match the log-space code to <1.3e-13 incl. missing 8/9).
+
+double forwardAlgorithmLin(int * newh, int ** existing_h, double ** Alphamat, double * Asvec, double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob, double * copy_probSTART, double * TransProb, struct param_t *Par) {
+  int Nh=*p_Nhaps, Nl=*p_Nloci, i, locus;
+  double s=0.0;
+  for(i=0;i<Nh;i++){
+    double e=cp_emis(newh[0], existing_h[i][0], MutProb_vec[i]);
+    Alphamat[0][i]=copy_probSTART[i]*e;          // LINEAR (true forward at locus 0)
+    s += Alphamat[0][i]*TransProb[0];
+  }
+  Asvec[0]=log(s);
+  for(locus=1; locus<Nl; locus++){
+    double rlm1=(locus>=2)?exp(Asvec[locus-2]-Asvec[locus-1]):exp(-Asvec[0]);
+    double sp=(1-TransProb[locus-1])*rlm1;
+    double tl=(locus<Nl-1)?TransProb[locus]:1.0;
+    double sm=0.0; double *al=Alphamat[locus], *alm=Alphamat[locus-1];
+#pragma omp parallel for reduction(+:sm) schedule(static)
+    for(i=0;i<Nh;i++){
+      double e=cp_emis(newh[locus], existing_h[i][locus], MutProb_vec[i]);
+      double a=e*copy_prob[i] + e*sp*alm[i];
+      al[i]=a; sm += a*tl;
+    }
+    Asvec[locus]=Asvec[locus-1]+log(sm);
+  }
+  if(isnan(Asvec[Nl-1])){ fprintf(Par->out,"forwardAlgorithmLin: NaN/negative likelihood (emission/transition too low?)...Exiting...\n"); stop_on_error(1,Par->errormode,Par->err); }
+  return Asvec[Nl-1];
+}
+
+void backwardAlgorithmLin(int finalrun,int ndonorpops,int ind_val,double Alphasum,double p_rhobar, double * N_e_new,int * newh, int ** existing_h, double ** Alphamat, double * Asvec, double * lambda, double delta,double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob,double * copy_prob_new,double * copy_prob_newSTART, double *corrected_chunk_count, double *expected_chunk_length, double * expected_differences,double *regional_chunk_count_sum_final,double *regional_chunk_count_sum_squared_final, int *num_regions, double * copy_probSTART, double * TransProb,int * pop_vec,double *pos, double * snp_info_measure, struct files_t *Outfiles, struct param_t *Par){
+  int Nh=*p_Nhaps, Nl=*p_Nloci, i, locus;
+  double Asf=Asvec[Nl-1];                 // = Alphasum (cumulative forward log-normalizer)
+  double *cprev=malloc(Nh*sizeof(double));   // c[locus+1][i] (linear)
+  double *ccur =malloc(Nh*sizeof(double));   // c[locus][i]   (linear)
+  double *Bs   =malloc(Nl*sizeof(double));   // backward cumulative log-normalizers
+  double *exp_copy_pop=malloc(ndonorpops*sizeof(double));
+  double *ind_snp_sum_vec=malloc(ndonorpops*sizeof(double));
+  double *expected_transition_prob=malloc((Nl-1)*sizeof(double));
+  double *regional_chunk_count=malloc(Nh*sizeof(double));
+  double *regional_chunk_count_sum=malloc(ndonorpops*sizeof(double));
+  double rounding_val=1.0/10000000.0;
+  double total_regional_chunk_count=0.0;
+
+  for(i=0;i<ndonorpops;i++){ regional_chunk_count_sum[i]=0.0; ind_snp_sum_vec[i]=0.0; }
+  for(i=0;i<Nh;i++){ copy_prob_new[i]=0.0; corrected_chunk_count[i]=0.0; expected_chunk_length[i]=0.0; expected_differences[i]=0.0; regional_chunk_count[i]=0.0; }
+  *num_regions=0;
+
+  // INIT at last locus l=Nl-1: c=1
+  double sb=0.0, S_end=exp(Asvec[Nl-2]-Asf);
+  if(finalrun) for(i=0;i<ndonorpops;i++) exp_copy_pop[i]=0.0;
+  for(i=0;i<Nh;i++){
+    cprev[i]=1.0;
+    double e=cp_emis(newh[Nl-1],existing_h[i][Nl-1],MutProb_vec[i]);
+    sb += TransProb[Nl-2]*copy_prob[i]*e;
+    double am=Alphamat[Nl-1][i]*S_end;                 // = a[N-1]*c[N-1]*scalar, c=1
+    if(finalrun) exp_copy_pop[pop_vec[i]]+=am;
+    expected_differences[i]+=am*(newh[Nl-1]!=existing_h[i][Nl-1]);
+  }
+  Bs[Nl-1]=log(sb);
+  if(finalrun) printCopyProbs(exp_copy_pop,ind_val,pos[Nl-1],Outfiles,Par);
+
+  // INDUCTION
+  for(locus=Nl-2; locus>=0; locus--){
+    double rb=(locus+2<=Nl-1)?exp(Bs[locus+2]-Bs[locus+1]):exp(-Bs[Nl-1]);
+    double om=(1-TransProb[locus]);
+    // c[locus] (linear) + Bs[locus]
+    for(i=0;i<Nh;i++){ double ep1=cp_emis(newh[locus+1],existing_h[i][locus+1],MutProb_vec[i]); ccur[i]=1.0+om*rb*ep1*cprev[i]; }
+    if(locus>0){ double s2=0.0; for(i=0;i<Nh;i++){ double e=cp_emis(newh[locus],existing_h[i][locus],MutProb_vec[i]); s2+=TransProb[locus-1]*copy_prob[i]*e*ccur[i]; } Bs[locus]=Bs[locus+1]+log(s2); }
+    double BsR=(locus+2<=Nl-1)?Bs[locus+2]:0.0, Asm1=(locus>=1)?Asvec[locus-1]:0.0;
+    double KF1=exp(Asvec[locus]+BsR-Asf), KF=exp(Asm1+BsR-Asf), KC=exp(Asm1+Bs[locus+1]-Asf);
+    double total_prob=0.0;
+    if(finalrun) for(i=0;i<ndonorpops;i++) exp_copy_pop[i]=0.0;
+#pragma omp parallel for reduction(+:total_prob,total_regional_chunk_count) reduction(+:ind_snp_sum_vec[:ndonorpops]) reduction(+:exp_copy_pop[:ndonorpops]) schedule(static)
+    for(i=0;i<Nh;i++){
+      double ep1=cp_emis(newh[locus+1],existing_h[i][locus+1],MutProb_vec[i]);
+      double e_a_lp1_bp=Alphamat[locus+1][i]*cprev[i]*KF1;
+      double e_a_l_bp  =Alphamat[locus][i]*cprev[i]*KF;
+      double e_a_l_bc  =Alphamat[locus][i]*ccur[i]*KC;
+      double inc=e_a_lp1_bp - e_a_l_bp*ep1*om;
+      total_prob+=inc; copy_prob_new[i]+=inc;
+      double cp_i=copy_prob[i];
+      double tp_from_i_to_i=e_a_l_bp*ep1*(1-TransProb[locus]+TransProb[locus]*cp_i);
+      double tp_to_i_excl  =e_a_lp1_bp - tp_from_i_to_i;
+      double tp_from_i_excl=e_a_l_bc  - tp_from_i_to_i;
+      regional_chunk_count[i]+=inc; total_regional_chunk_count+=inc;
+      ind_snp_sum_vec[pop_vec[i]]+=inc; corrected_chunk_count[i]+=inc;
+      if(Par->unlinked_ind==0 && lambda[locus]>=0) expected_chunk_length[i]+=100*(pos[locus+1]-pos[locus])*delta*lambda[locus]*(tp_from_i_to_i+0.5*(tp_to_i_excl+tp_from_i_excl));
+      expected_differences[i]+=e_a_l_bc*(newh[locus]!=existing_h[i][locus]);
+      if(locus==0) copy_prob_newSTART[i]=e_a_l_bc;     // = a[0]*c[0]*K0 (KC at l=0)
+      if(finalrun) exp_copy_pop[pop_vec[i]]+=e_a_l_bc;
+    }
+    if(finalrun) printCopyProbs(exp_copy_pop,ind_val,pos[locus],Outfiles,Par);
+    expected_transition_prob[locus]=total_prob;
+    if((total_regional_chunk_count+rounding_val)>=Par->region_size){
+      for(i=0;i<Nh;i++){ regional_chunk_count_sum[pop_vec[i]]+=regional_chunk_count[i]; regional_chunk_count[i]=0.0; }
+      for(i=0;i<ndonorpops;i++){ regional_chunk_count_sum_final[i]+=regional_chunk_count_sum[i]; regional_chunk_count_sum_squared_final[i]+=pow(regional_chunk_count_sum[i],2.0); regional_chunk_count_sum[i]=0.0; }
+      total_regional_chunk_count=0.0; *num_regions=*num_regions+1;
+    }
+    double total_ind_sum=0.0; for(i=0;i<ndonorpops;i++) total_ind_sum+=ind_snp_sum_vec[i];
+    for(i=0;i<ndonorpops;i++){ snp_info_measure[i]+=pow((ind_snp_sum_vec[i]/total_ind_sum),2.0); ind_snp_sum_vec[i]=0.0; }
+    { double *t=cprev; cprev=ccur; ccur=t; }       // c[locus] becomes c[locus+1] for next iter
+  }
+  if(finalrun) printTransitionProb(expected_transition_prob,ind_val,(int)(Nl),Outfiles);
+  for(i=0;i<ndonorpops;i++) snp_info_measure[i]/=Nl;
+
+  // N_e (Scheet/Stephens 2006 C3)
+  double total_prob2=0.0,total_gen_dist=0.0;
+  for(locus=0; locus<Nl-1; locus++){
+    if(Par->unlinked_ind==0 && lambda[locus]>=0){
+      total_gen_dist+=(pos[locus+1]-pos[locus])*delta*lambda[locus];
+      total_prob2+=((p_rhobar*(pos[locus+1]-pos[locus])*delta*lambda[locus])/(1.0-exp(-1.0*p_rhobar*(pos[locus+1]-pos[locus])*delta*lambda[locus])))*expected_transition_prob[locus];
+    }
+  }
+  if(Par->unlinked_ind==0){ *N_e_new=total_prob2/total_gen_dist; if(*N_e_new<MIN_NE)*N_e_new=MIN_NE; }
+  if(Par->unlinked_ind==1) *N_e_new=0.0;
+
+  for(i=0;i<Nh;i++) corrected_chunk_count[i]+=copy_prob_newSTART[i];   // start term
+
+  free(cprev);free(ccur);free(Bs);free(exp_copy_pop);free(ind_snp_sum_vec);
+  free(expected_transition_prob);free(regional_chunk_count);free(regional_chunk_count_sum);
+}
+
+///////////////////////////////////////////////
 double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, int *p_Nloci, int *p_Nhaps, int *p_nchr, double p_rhobar, double * MutProb_vec, int * allelic_type_count_vec, double * lambda, double * pos, double * copy_prob, double * copy_probSTART, int * pop_vec, int * cond_mat_haplotypes,int ndonorpops, int run_num, int ind_val, struct files_t *Outfiles, struct param_t *Par)
 {
 
@@ -424,16 +560,24 @@ double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, in
   if(Par->vverbose) fprintf(Par->out,"        sampler: forwards algorithm\n");
       /* FORWARDS ALGORITHM: (Rabiner 1989, p.262) */
   char *cpfold_env = getenv("CPFOLD");
+  int use_lin = getenv("CPLINEAR") != NULL;   /* linear-space O(N)-transcendental dense */
+  double *Asvec = use_lin ? malloc((*p_Nloci)*sizeof(double)) : NULL;
   double t_dense0 = cpfold_env ? omp_get_wtime() : 0.0;
-  double Alphasum = forwardAlgorithm(newh, existing_h, Alphamat, MutProb_vec, p_Nhaps,p_Nloci,copy_prob, copy_probSTART, TransProb,Par);
+  double Alphasum = use_lin
+    ? forwardAlgorithmLin(newh, existing_h, Alphamat, Asvec, MutProb_vec, p_Nhaps,p_Nloci,copy_prob, copy_probSTART, TransProb,Par)
+    : forwardAlgorithm(newh, existing_h, Alphamat, MutProb_vec, p_Nhaps,p_Nloci,copy_prob, copy_probSTART, TransProb,Par);
 
   if(Outfiles->usingFile[2]) fprintf(Outfiles->fout3," %.10lf",Alphasum);
 
   if(Par->vverbose) fprintf(Par->out,"        sampler: backwards algorithm\n");
   int finalrun= (run_num == (Par->EMruns-1));
   if(run_num <= (Par->EMruns-1)){
-    backwardAlgorithm(finalrun,ndonorpops,ind_val,Alphasum,p_rhobar,&N_e_new,newh,existing_h,Alphamat,lambda,delta,MutProb_vec,p_Nhaps,p_Nloci,copy_prob,copy_prob_new,copy_prob_newSTART, corrected_chunk_count, expected_chunk_length, expected_differences,regional_chunk_count_sum_final,regional_chunk_count_sum_squared_final, &num_regions, copy_probSTART, TransProb, pop_vec,pos,snp_info_measure,Outfiles,Par);
+    if(use_lin)
+      backwardAlgorithmLin(finalrun,ndonorpops,ind_val,Alphasum,p_rhobar,&N_e_new,newh,existing_h,Alphamat,Asvec,lambda,delta,MutProb_vec,p_Nhaps,p_Nloci,copy_prob,copy_prob_new,copy_prob_newSTART, corrected_chunk_count, expected_chunk_length, expected_differences,regional_chunk_count_sum_final,regional_chunk_count_sum_squared_final, &num_regions, copy_probSTART, TransProb, pop_vec,pos,snp_info_measure,Outfiles,Par);
+    else
+      backwardAlgorithm(finalrun,ndonorpops,ind_val,Alphasum,p_rhobar,&N_e_new,newh,existing_h,Alphamat,lambda,delta,MutProb_vec,p_Nhaps,p_Nloci,copy_prob,copy_prob_new,copy_prob_newSTART, corrected_chunk_count, expected_chunk_length, expected_differences,regional_chunk_count_sum_final,regional_chunk_count_sum_squared_final, &num_regions, copy_probSTART, TransProb, pop_vec,pos,snp_info_measure,Outfiles,Par);
   }
+  if(Asvec) free(Asvec);
 
   /* ---- CPFOLD benchmark: exact block-fold of the chunk counts (env CPFOLD=1) ----
      Runs the O(N*Umean) fold on the SAME data + TransProb the dense just used,
