@@ -349,7 +349,7 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *
 /* Entry point. Builds locus-major donor buffer from existing_h (int** hap-major),
    the recipient row from newh, sets engine state, builds the (panel-fixed) grouping
    [timed -> *t_build] and runs the fold [timed -> *t_fold]. out_ccpop[ndonorpops]. */
-void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
+void cpfold_perpop(signed char *newh, signed char **existing_h, int nhaps, int nloci,
                    double *TransProb, double *MutProb_vec, double *copy_prob, double *copy_probSTART,
                    double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
@@ -365,7 +365,7 @@ void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
     int bypop=0;
     for(int i=1;i<K;i++){ if(copy_prob[i]!=copy_prob[0]||copy_probSTART[i]!=copy_probSTART[0]||MutProb_vec[i]!=MutProb_vec[0]){ bypop=1; break; } }
     donors=malloc((size_t)N*K);
-    for(int i=0;i<K;i++){ int *row=existing_h[i];
+    for(int i=0;i<K;i++){ signed char *row=existing_h[i];
         for(int l=0;l<N;l++) donors[(size_t)l*K+i]=(uint8_t)row[l]; }
     uint8_t *rh=malloc(N); for(int l=0;l<N;l++) rh[l]=(uint8_t)newh[l];
 

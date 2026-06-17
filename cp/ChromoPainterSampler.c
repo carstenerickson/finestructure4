@@ -43,7 +43,7 @@ double deltaLiStephens(double * TransProb, double * pos, double p_rhobar, double
   return(delta);
 }
 
-double InitialiseForward(int * newh, int ** existing_h, double ** Alphamat, double * MutProb_vec, int *p_Nhaps,int *p_Nloci, double * copy_probSTART, double * TransProb) {
+double InitialiseForward(signed char * newh, signed char ** existing_h, double ** Alphamat, double * MutProb_vec, int *p_Nhaps,int *p_Nloci, double * copy_probSTART, double * TransProb) {
 //double InitialiseForward(struct_t *Fb, double * TransProb){
   int i;
   double Alphasum=0;
@@ -67,7 +67,7 @@ double InitialiseForward(int * newh, int ** existing_h, double ** Alphamat, doub
   return(Alphasum);
 }
 
-double forwardAlgorithm(int * newh, int ** existing_h, double ** Alphamat, double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob, double * copy_probSTART, double * TransProb, struct param_t *Par) {
+double forwardAlgorithm(signed char * newh, signed char ** existing_h, double ** Alphamat, double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob, double * copy_probSTART, double * TransProb, struct param_t *Par) {
 //double forwardAlgorithm(struct_t *Fb, struct param_t *Par){
   // Perform the forward step
   // return alphasum, the sum of the forward weightings (logged)
@@ -139,7 +139,7 @@ double forwardAlgorithm(int * newh, int ** existing_h, double ** Alphamat, doubl
 ///////////////////////////////////////////////
 // Backwards algorithm
 
-void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,double p_rhobar, double * N_e_new,int * newh, int ** existing_h, double ** Alphamat, double * lambda, double delta,double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob,double * copy_prob_new,double * copy_prob_newSTART, double *corrected_chunk_count, double *expected_chunk_length, double * expected_differences,double *regional_chunk_count_sum_final,double *regional_chunk_count_sum_squared_final, int *num_regions, double * copy_probSTART, double * TransProb,int * pop_vec,double *pos, double * snp_info_measure, struct files_t *Outfiles, struct param_t *Par){
+void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,double p_rhobar, double * N_e_new,signed char * newh, signed char ** existing_h, double ** Alphamat, double * lambda, double delta,double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob,double * copy_prob_new,double * copy_prob_newSTART, double *corrected_chunk_count, double *expected_chunk_length, double * expected_differences,double *regional_chunk_count_sum_final,double *regional_chunk_count_sum_squared_final, int *num_regions, double * copy_probSTART, double * TransProb,int * pop_vec,double *pos, double * snp_info_measure, struct files_t *Outfiles, struct param_t *Par){
 
   double total_regional_chunk_count,total_gen_dist;
   double Betasum, Betasumnew;
@@ -375,7 +375,7 @@ void  backwardAlgorithm(int finalrun,int ndonorpops,int ind_val,double Alphasum,
 // and the rescaling convention were derived and numerically verified (workflow
 // w51kwighz, all outputs match the log-space code to <1.3e-13 incl. missing 8/9).
 
-double forwardAlgorithmLin(int * newh, int ** existing_h, double ** Alphamat, double * Asvec, double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob, double * copy_probSTART, double * TransProb, struct param_t *Par) {
+double forwardAlgorithmLin(signed char * newh, signed char ** existing_h, double ** Alphamat, double * Asvec, double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob, double * copy_probSTART, double * TransProb, struct param_t *Par) {
   int Nh=*p_Nhaps, Nl=*p_Nloci, i, locus;
   double s=0.0;
   for(i=0;i<Nh;i++){
@@ -401,7 +401,7 @@ double forwardAlgorithmLin(int * newh, int ** existing_h, double ** Alphamat, do
   return Asvec[Nl-1];
 }
 
-void backwardAlgorithmLin(int finalrun,int ndonorpops,int ind_val,double Alphasum,double p_rhobar, double * N_e_new,int * newh, int ** existing_h, double ** Alphamat, double * Asvec, double * lambda, double delta,double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob,double * copy_prob_new,double * copy_prob_newSTART, double *corrected_chunk_count, double *expected_chunk_length, double * expected_differences,double *regional_chunk_count_sum_final,double *regional_chunk_count_sum_squared_final, int *num_regions, double * copy_probSTART, double * TransProb,int * pop_vec,double *pos, double * snp_info_measure, struct files_t *Outfiles, struct param_t *Par){
+void backwardAlgorithmLin(int finalrun,int ndonorpops,int ind_val,double Alphasum,double p_rhobar, double * N_e_new,signed char * newh, signed char ** existing_h, double ** Alphamat, double * Asvec, double * lambda, double delta,double * MutProb_vec, int *p_Nhaps,int *p_Nloci,double * copy_prob,double * copy_prob_new,double * copy_prob_newSTART, double *corrected_chunk_count, double *expected_chunk_length, double * expected_differences,double *regional_chunk_count_sum_final,double *regional_chunk_count_sum_squared_final, int *num_regions, double * copy_probSTART, double * TransProb,int * pop_vec,double *pos, double * snp_info_measure, struct files_t *Outfiles, struct param_t *Par){
   int Nh=*p_Nhaps, Nl=*p_Nloci, i, locus;
   double Asf=Asvec[Nl-1];                 // = Alphasum (cumulative forward log-normalizer)
   double *cprev=malloc(Nh*sizeof(double));   // c[locus+1][i] (linear)
@@ -502,7 +502,7 @@ void backwardAlgorithmLin(int finalrun,int ndonorpops,int ind_val,double Alphasu
 }
 
 ///////////////////////////////////////////////
-double ** sampler(double ** copy_prob_new_mat, int * newh, int ** existing_h, int *p_Nloci, int *p_Nhaps, int *p_nchr, double p_rhobar, double * MutProb_vec, int * allelic_type_count_vec, double * lambda, double * pos, double * copy_prob, double * copy_probSTART, int * pop_vec, int * cond_mat_haplotypes,int ndonorpops, int run_num, int ind_val, struct files_t *Outfiles, struct param_t *Par)
+double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char ** existing_h, int *p_Nloci, int *p_Nhaps, int *p_nchr, double p_rhobar, double * MutProb_vec, int * allelic_type_count_vec, double * lambda, double * pos, double * copy_prob, double * copy_probSTART, int * pop_vec, int * cond_mat_haplotypes,int ndonorpops, int run_num, int ind_val, struct files_t *Outfiles, struct param_t *Par)
 {
 
 

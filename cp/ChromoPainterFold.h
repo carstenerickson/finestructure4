@@ -34,7 +34,7 @@ static inline double cp_emis(int r, int d, double m){
    alone (= sum over donors in pop p of the locus-0 posterior). out_ccpop-out_start
    is therefore the per-pop posterior chunk count EXCLUDING start, the dense
    copy_prob_new per-pop total that drives the copy-proportion E-M update (-ip). */
-void cpfold_perpop(int *newh, int **existing_h, int nhaps, int nloci,
+void cpfold_perpop(signed char *newh, signed char **existing_h, int nhaps, int nloci,
                    double *TransProb, double *MutProb_vec, double *copy_prob, double *copy_probSTART,
                    double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
