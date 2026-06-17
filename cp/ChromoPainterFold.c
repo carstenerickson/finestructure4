@@ -32,6 +32,7 @@ static int K, N, npop;
    (substring,pop) so copy_prob/mutation are constant within each group. */
 static double *cf_cp, *cf_cps, *cf_mut;
 static uint8_t *donors;     /* [N*K] locus-major, built from existing_h */
+static int donors_built_N, donors_built_K;  /* dims of a retained `donors` (retain_panel) */
 static int *pop_vec;        /* [K] donor population */
 static double *T;           /* [N-1] transition (the caller's TransProb) */
 static double *pos_g, *lam_g, delta_g, rho_g;  /* for the N_e (-in) EM update */
@@ -355,7 +356,7 @@ void cpfold_perpop(signed char *newh, signed char **existing_h, int nhaps, int n
                    int *pop_vec_in, int ndonorpops, int Ustar,
                    double *out_ccpop, double *out_start, double *out_ndiff, double *out_nlen, double *out_Ne,
                    double *out_loglik, double *out_etp, double *out_ecp, int samplesTOT, int *out_samples,
-                   double *t_build, double *t_fold){
+                   double *t_build, double *t_fold, int retain_panel){
     K=nhaps; N=nloci; npop=ndonorpops;
     cf_cp=copy_prob; cf_cps=copy_probSTART; cf_mut=MutProb_vec;
     pop_vec=pop_vec_in; T=TransProb;
@@ -364,9 +365,27 @@ void cpfold_perpop(signed char *newh, signed char **existing_h, int nhaps, int n
        non-uniform (-p or -m); substring-only otherwise (the fast common path). */
     int bypop=0;
     for(int i=1;i<K;i++){ if(copy_prob[i]!=copy_prob[0]||copy_probSTART[i]!=copy_probSTART[0]||MutProb_vec[i]!=MutProb_vec[0]){ bypop=1; break; } }
-    donors=malloc((size_t)N*K);
-    for(int i=0;i<K;i++){ signed char *row=existing_h[i];
-        for(int l=0;l<N;l++) donors[(size_t)l*K+i]=(uint8_t)row[l]; }
+    /* Build the locus-major donor buffer from existing_h (hap-major). With retain_panel
+       (single-recipient -fold) build only when the panel is not already resident for this
+       (N,K): existing_h is then read just once. Otherwise (re)build every call - the panel
+       changes between recipients. */
+    if(!retain_panel || donors==NULL || donors_built_N!=N || donors_built_K!=K){
+        if(retain_panel) free(donors);   /* drop a stale retained panel on a size change */
+        donors=malloc((size_t)N*K);
+        for(int i=0;i<K;i++){ signed char *row=existing_h[i];
+            for(int l=0;l<N;l++) donors[(size_t)l*K+i]=(uint8_t)row[l];
+            /* retain: this hap-major donor row is now fully copied into the locus-major
+               buffer and is dead. Free it HERE - before build_groups/fold_cc allocate the
+               fold working set - so the hap-major panel and the working set never coexist
+               (that is what drops the peak; freeing after the fold returns does not, since
+               the peak already happened). Freed via the existing_h alias into
+               all_chromosomes; the caller nulls the canonical all_chromosomes entry next
+               so DestroyData does not double-free. Leave-one-out keeps the recipient's own
+               rows out of existing_h, so newh is never touched. */
+            if(retain_panel){ free(row); existing_h[i]=NULL; }
+        }
+        donors_built_N=N; donors_built_K=K;
+    }
     uint8_t *rh=malloc(N); for(int l=0;l<N;l++) rh[l]=(uint8_t)newh[l];
 
     double tb0=cf_now();
@@ -377,5 +396,11 @@ void cpfold_perpop(signed char *newh, signed char **existing_h, int nhaps, int n
     fold_cc(rh, out_ccpop, out_start, out_ndiff, out_nlen, out_Ne, out_loglik, out_etp, out_ecp, samplesTOT, out_samples, &Gr);
     *t_fold=cf_now()-tf0;
 
-    free_groups(&Gr); free(donors); free(rh);
+    /* Keep the donor buffer across calls when retaining (released by cpfold_cleanup);
+       otherwise free it and null the static so cpfold_cleanup stays a safe no-op. */
+    free_groups(&Gr); if(!retain_panel){ free(donors); donors=NULL; } free(rh);
 }
+
+/* Free a retained locus-major donor buffer. No-op when none is held; idempotent, so it
+   is safe to call unconditionally at teardown (including the error path). */
+void cpfold_cleanup(void){ free(donors); donors=NULL; donors_built_N=0; donors_built_K=0; }

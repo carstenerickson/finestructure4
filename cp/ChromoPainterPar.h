@@ -40,6 +40,10 @@ extern "C" {
     int prior_donor_probs_ind;
     int use_fold;        /* -fold: exact block-fold chunk counts (O(N*Umean), -i 0 only) */
     int fold_ustar;      /* -fold target groups per block (default 24) */
+    int fold_retain_panel; /* -fold + single recipient (-a i i): build the locus-major
+                              donor panel once and free the hap-major all_chromosomes
+                              donor rows, halving the per-recipient panel residency.
+                              0 for multi-recipient/all-vs-all (panel reused per recipient). */
     int mutation_rate_ind;
     int print_file9_ind;
     int indcount_suppress_ind;

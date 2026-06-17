@@ -2,6 +2,7 @@
 #include <setjmp.h>
 #include "ChromoPainterMutEM.h"
 #include "ChromoPainterConstants.h"
+#include "ChromoPainterFold.h"   /* cpfold_cleanup(): release the retained -fold donor panel */
 
 
 
@@ -540,6 +541,7 @@ void cleanup(int retval,struct param_t *Par,struct donor_t *Donors,
   freeOutfiles(Outfiles);
   if(Par->vverbose) fprintf(Par->out,"Freeing data\n");
   fflush(Par->out);
+  cpfold_cleanup();   /* release the retained -fold donor panel (no-op if unused) */
   DestroyData(Data);
 
   if(Par->vverbose) fprintf(Par->out,"Freeing ids\n");

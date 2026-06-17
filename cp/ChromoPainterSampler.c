@@ -617,7 +617,7 @@ double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char *
     int *fsamp = (fsTOT>0) ? malloc((size_t)fsTOT*(*p_Nloci)*sizeof(int)) : NULL;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
                   copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops,
-                  Par->fold_ustar, fpp, fstart, fdiff, flen, &N_e_new, &foldloglik, etp_out, ecp_out, fsTOT, fsamp, &tb, &tf);
+                  Par->fold_ustar, fpp, fstart, fdiff, flen, &N_e_new, &foldloglik, etp_out, ecp_out, fsTOT, fsamp, &tb, &tf, Par->fold_retain_panel);
     Alphasum = foldloglik;
     /* write the sampled paths to .samples.out.gz (same format as the dense; the
        per-recipient "HAP h+1 label" header line is written in the common driver). */
@@ -685,7 +685,7 @@ double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char *
     double t_build=0, t_fold=0, Ne_fold=0, ll_fold=0;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
                   copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops, Ustar,
-                  ccfold, NULL, cdfold, clfold, &Ne_fold, &ll_fold, NULL, NULL, 0, NULL, &t_build, &t_fold);
+                  ccfold, NULL, cdfold, clfold, &Ne_fold, &ll_fold, NULL, NULL, 0, NULL, &t_build, &t_fold, 0);
     double mre=0,mrd=0,mrl=0; for(int p=0;p<ndonorpops;p++){
       double e=fabs(ccfold[p]-ccdense[p])/(fabs(ccdense[p])+1e-300); if(e>mre)mre=e;
       double d=fabs(cdfold[p]-cddense[p])/(fabs(cddense[p])+1e-300); if(d>mrd)mrd=d;
@@ -902,9 +902,16 @@ int loglik(struct copyvec_t *Copyvec, struct donor_t *Donors, struct data_t *Dat
 
   total_prob = 0.0;
   total_probSTART = 0.0;
+  /* single-recipient -fold (-a i i => exactly one recipient): build the locus-major donor
+     panel once and free the hap-major all_chromosomes donor rows afterwards, ~halving the
+     per-recipient panel residency. Off for multi-recipient/all-vs-all, where the
+     leave-one-out donor set (and the recipient's own rows) differ per recipient and the
+     hap-major panel must be reread - there -fold behaves exactly as before. */
+  Par->fold_retain_panel = (Par->use_fold && (Par->end_val - Par->start_val == 1)) ? 1 : 0;
   for (m = Par->start_val; m < Par->end_val; m ++)
     {
       setIndAsRecipient(m,Data,Ids,Par);// set up data to paint the m-th individual
+      int panel_freed=0;
       nhaps = Data->current_donor_nind*Data->hapsperind;
       int nhapseff=Donors->ndonorhaps + Data->reciphaps;
 
@@ -1023,6 +1030,18 @@ int loglik(struct copyvec_t *Copyvec, struct donor_t *Donors, struct data_t *Dat
 				  &nhaps, 
 				  &nhapseff,
 				  N_e, MutProb_vec_new, allelic_type_count_vec, Copyvec->recom_map, Data->positions, copy_prob_new, copy_prob_newSTART, copy_pop_vec, Data->current_donor_haps, Donors->ndonorpops, r, m, Outfiles,Par);
+
+		      /* single-recipient -fold: cpfold_perpop already FREED each hap-major donor
+			 row (via the cond_chromosomes alias) right after the transpose - that early
+			 free is what drops the peak. Here we only NULL the canonical all_chromosomes
+			 entries so DestroyData does not double-free those rows. current_donor_haps is
+			 leave-one-out, so the recipient's own rows (ind_chromosomes / newh) are never
+			 in this set and survive. */
+		      if(Par->fold_retain_panel && !panel_freed){
+			for(int dh=0; dh<nhaps; dh++)
+			  Data->all_chromosomes[Data->current_donor_haps[dh]]=NULL;
+			panel_freed=1;
+		      }
 
     
 	      N_e_new=N_e_new+back_prob[0][nhaps];

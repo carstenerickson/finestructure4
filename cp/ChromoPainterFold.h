@@ -34,12 +34,24 @@ static inline double cp_emis(int r, int d, double m){
    alone (= sum over donors in pop p of the locus-0 posterior). out_ccpop-out_start
    is therefore the per-pop posterior chunk count EXCLUDING start, the dense
    copy_prob_new per-pop total that drives the copy-proportion E-M update (-ip). */
+/* retain_panel != 0 (single-recipient -fold): the locus-major donor buffer is built
+   once and kept across calls with the same (nhaps,nloci) panel, so existing_h is read
+   only on the first call. On that first build each hap-major donor row is freed (via the
+   existing_h alias) as soon as it is copied - before the fold working set is allocated -
+   so the two never coexist and the peak drops; existing_h[i] is nulled. The caller must
+   then null the canonical all_chromosomes entries (they alias the freed rows) so cleanup
+   does not double-free. Pass 0 to rebuild-and-free the buffer per call without touching
+   existing_h (the default, required when the panel changes between recipients). Call
+   cpfold_cleanup() once at teardown to release a retained buffer. */
 void cpfold_perpop(signed char *newh, signed char **existing_h, int nhaps, int nloci,
                    double *TransProb, double *MutProb_vec, double *copy_prob, double *copy_probSTART,
                    double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
                    double *out_ccpop, double *out_start, double *out_ndiff, double *out_nlen, double *out_Ne,
                    double *out_loglik, double *out_etp, double *out_ecp, int samplesTOT, int *out_samples,
-                   double *t_build, double *t_fold);
+                   double *t_build, double *t_fold, int retain_panel);
+
+/* Free the retained locus-major donor buffer (no-op if none). Idempotent. */
+void cpfold_cleanup(void);
 
 #endif
