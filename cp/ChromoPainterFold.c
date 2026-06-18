@@ -160,7 +160,7 @@ static int fold_sample_donor(int l, Groups *Gr, const double *GF, const double *
 
 /* samplesTOT>0 + sout!=NULL: also draw samplesTOT copying paths (hierarchical FFBS
    over the affine forward, no full Alphamat) into sout[s*N+l] = donor index. */
-static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *ndiff, double *nlen, double *Ne_out, double *loglik_out, double *etp_out, double *ecp_out, int samplesTOT, int *sout, Groups *Gr){
+static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *ndiff, double *nlen, double *Ne_out, double *loglik_out, double *etp_out, double *ecp_out, double region_size, double *out_regfinal, double *out_regsq, int *out_numreg, int samplesTOT, int *sout, Groups *Gr){
     #define EM(L,II) cp_emis(rh[(L)], donors[(size_t)(L)*K+(II)], cf_mut[(II)])
     int nb=Gr->nb, Umax=Gr->Umax; Block *blk=Gr->blk; int *gidB=Gr->gidB;
     int *sizeg=Gr->sizeg, *repg=Gr->repg;
@@ -181,6 +181,10 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *
     double *SwP=malloc((size_t)Umax*npop*sizeof(double)), *SawP=malloc((size_t)Umax*npop*sizeof(double));
     double *Mc=malloc((size_t)Gr->maxcell*npop*sizeof(double)), *Mce=malloc((size_t)Gr->maxcell*npop*sizeof(double));
     double *sumA_arr = (samplesTOT>0 && sout) ? malloc(sizeof(double)*N) : NULL;  /* rescaled forward sum S~[l], for sampling */
+    /* regional bootstrap accumulators (the dense's regional_chunk_count_sum +
+       total_regional_chunk_count): per-pop chunk count banked into a region of
+       region_size cumulative count. regreg resets to 0 at each bank. */
+    double *regreg = calloc(npop, sizeof(double)); double totalreg = 0.0;
 
     for(int b=0;b<nb;b++){ int sb=blk[b].s,eb=blk[b].e,U=blk[b].U; int *rp=repg+(size_t)b*Umax;
         double *base=Eg+off[b]; double *cpg=CPG+(size_t)b*Umax, *cpsg=CPSG+(size_t)b*Umax;
@@ -241,6 +245,8 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *
     double Asf=As[N-1];
     for(int p=0;p<npop;p++) ccpop[p]=0.0;
     if(startpop) for(int p=0;p<npop;p++) startpop[p]=0.0;
+    if(out_regfinal){ for(int p=0;p<npop;p++){ out_regfinal[p]=0.0; out_regsq[p]=0.0; } }
+    if(out_numreg) *out_numreg=0;
     /* EM quantities (-in N_e, -iM global mutation), verified fold (wf wxk7vegbf):
        N_e from per-locus etp (the chunkcount total) rho-weighted by the dense gd_l;
        per-pop expected_differences from e_a_l_bc=a_l*c_l*KC folded over the moments. */
@@ -286,7 +292,7 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *
                     double aA=KF1*GFr1[g]*GBl1, aB=KF1*GFr1[g]*PBl1, aC=KF1*PFr1[g]*GBl1, aD=KF1*PFr1[g]*PBl1; /* e_a_lp1_bp */
                     for(int p=0;p<npop;p++){ double s_=szP[base+p]; if(s_==0.0) continue;
                         double inc=cA*s_ + cB*SaP[base+p] + cC*SwP[base+p] + cD*SawP[base+p];
-                        ccpop[p]+=inc; etpl+=inc;
+                        ccpop[p]+=inc; etpl+=inc; regreg[p]+=inc;
                         nlen[p]+=Glh*(aA*s_ + aB*SwP[base+p] + aC*SaP[base+p] + aD*SawP[base+p]); }
                 }
             } else if(b+1<nb){
@@ -303,7 +309,7 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *
                     /* e_a_lp1_bp at boundary: a_{eb}=GF2+PF2*a_l, a_l=GFr+PFr*ent, so
                        a_{eb}*cx2 summed = (GF2+PF2*GFr)*Mc + PF2*PFr*Mce, times KF1. */
                     double bA=KF1*(GF2[g2]+PF2[g2]*GFr[g]), bB=KF1*PF2[g2]*PFr[g];
-                    for(int p=0;p<npop;p++){ double inc=cf0*Mc[base+p]+cf1*Mce[base+p]; ccpop[p]+=inc; etpl+=inc;
+                    for(int p=0;p<npop;p++){ double inc=cf0*Mc[base+p]+cf1*Mce[base+p]; ccpop[p]+=inc; etpl+=inc; regreg[p]+=inc;
                         nlen[p]+=Glh*(bA*Mc[base+p]+bB*Mce[base+p]); } }
             }
             /* N_e: dense gd_l rho-weight (pos/delta/lambda - NOT the T-form, which underflows).
@@ -313,6 +319,18 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *
             if(lam_g[l]>=0){ double gd=(pos_g[l+1]-pos_g[l])*delta_g*lam_g[l];
                 if(gd>0.0){ tot_gd+=gd; tot_prob_Ne+=(rho_g*gd/(1.0-exp(-rho_g*gd)))*etpl; } }
             if(etp_out) etp_out[l]=etpl;   /* per-locus transition prob (for -d), l in 0..N-2 */
+            /* regional bootstrap bank: replicate the dense's per-locus region cut
+               (ChromoPainterSampler.c backwardAlgorithmLin ~line 469). etpl is this
+               locus's total chunk count (= dense total_prob); the walk is the same
+               reverse N-2..0 order, so the region partition matches the dense up to
+               the ~1e-9 FP gap in the per-locus total. rounding_val=1e-7. The final
+               partial region (totalreg < region_size at the end) is NOT banked, as in
+               the dense. */
+            if(out_regfinal){ totalreg += etpl;
+              if(totalreg + 1e-7 >= region_size){
+                for(int p=0;p<npop;p++){ out_regfinal[p]+=regreg[p]; out_regsq[p]+=regreg[p]*regreg[p]; regreg[p]=0.0; }
+                totalreg=0.0; if(out_numreg)(*out_numreg)++;
+              } }
             /* per-pop expected_differences (e_a_l_bc=a_l*c_l*KC, mismatched donors) +
                the e_a_l_bc half of expected_chunk_length (all donors). CURRENT GBc/PBc.
                Summed over groups per pop, e_a_l_bc is the -b copy posterior at this locus. */
@@ -343,7 +361,7 @@ static void fold_cc(const uint8_t *rh, double *ccpop, double *startpop, double *
     free(off);free(GF);free(PF);free(Eg);free(AENTRY);free(WB);free(CEXIT);free(As);free(Bs);
     free(SentS);free(SwS);free(G);free(P);free(GBp);free(PBp);free(GBc);free(PBc);
     free(szP);free(SaP);free(SwP);free(SawP);free(aprev);free(cexit);free(Mc);free(Mce);free(CPG);free(CPSG);
-    free(sumA_arr);
+    free(sumA_arr);free(regreg);
     #undef EM
 }
 
@@ -355,7 +373,9 @@ void cpfold_perpop(signed char *newh, signed char **existing_h, int nhaps, int n
                    double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
                    double *out_ccpop, double *out_start, double *out_ndiff, double *out_nlen, double *out_Ne,
-                   double *out_loglik, double *out_etp, double *out_ecp, int samplesTOT, int *out_samples,
+                   double *out_loglik, double *out_etp, double *out_ecp,
+                   double region_size, double *out_regfinal, double *out_regsq, int *out_numreg,
+                   int samplesTOT, int *out_samples,
                    double *t_build, double *t_fold, int retain_panel){
     K=nhaps; N=nloci; npop=ndonorpops;
     cf_cp=copy_prob; cf_cps=copy_probSTART; cf_mut=MutProb_vec;
@@ -393,7 +413,8 @@ void cpfold_perpop(signed char *newh, signed char **existing_h, int nhaps, int n
     *t_build=cf_now()-tb0;
 
     double tf0=cf_now();
-    fold_cc(rh, out_ccpop, out_start, out_ndiff, out_nlen, out_Ne, out_loglik, out_etp, out_ecp, samplesTOT, out_samples, &Gr);
+    fold_cc(rh, out_ccpop, out_start, out_ndiff, out_nlen, out_Ne, out_loglik, out_etp, out_ecp,
+            region_size, out_regfinal, out_regsq, out_numreg, samplesTOT, out_samples, &Gr);
     *t_fold=cf_now()-tf0;
 
     /* Keep the donor buffer across calls when retaining (released by cpfold_cleanup);

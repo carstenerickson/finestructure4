@@ -19,11 +19,14 @@ NE=400000; MUT=0.0006338578
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 
-# Standard output files the fold reproduces byte-for-byte (regional bootstrap +
-# samples are not folded). prop = copy proportions. EMprobs is checked separately
-# (cmp_emprobs) because its N_e column is printed at %.10lf on a ~1e5 value, which
-# exposes FP-reorder noise in the last digit - byte-identity there is not expected,
-# but the SCHEMA (column count), the loglik columns and the mutation must match.
+# Standard output files the fold reproduces byte-for-byte. prop = copy proportions.
+# EMprobs is checked separately (cmp_emprobs) because its N_e column is printed at
+# %.10lf on a ~1e5 value, which exposes FP-reorder noise in the last digit -
+# byte-identity there is not expected, but the SCHEMA (column count), the loglik
+# columns and the mutation must match. The regional bootstrap (region[squared]chunk
+# counts) is now folded too but is checked separately (cmp_region) - it is only
+# FP-equivalent, not byte-identical, so a region boundary can land one locus off at
+# scale (see the chr-scale chromocombine `c` gate, not exercised on this tiny data).
 EXTS="chunkcounts chunklengths mutationprobs prop"
 
 run() { # env_prefix phase recom extra_args outprefix
@@ -116,16 +119,41 @@ env OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" -t "$ID" -f "
     -s 0 -i 0 -n "$NE" -M "$MUT" -fold -o "$TMP/f_a" >/dev/null 2>&1
 cmp_set "$TMP/d_a" "$TMP/f_a" "fold == dense   [-a 0 0]"
 
-# --- output suppression: -fold must NOT write the regional bootstrap files (a
-#     zero-filled .regionsquaredchunkcounts.out would collapse chromocombine's c)
-#     and must REJECT the per-locus -b/-d outputs it cannot produce. ---
-echo "=== -fold output suppression + per-locus outputs ==="
-# regional bootstrap genuinely cannot be folded -> the files must be ABSENT.
+# --- regional bootstrap: -fold now PRODUCES the regional files (it replicates the
+#     dense's per-locus region banking). They must be PRESENT and match the dense.
+#     On this tiny win data the region boundaries do not straddle the FP gap, so the
+#     files are byte-identical; cmp_region uses a 1e-6 numeric tolerance anyway, since
+#     at chr scale a boundary can shift one locus (the real gate there is chromocombine
+#     `c`, robust to such shifts - not exercised on this tiny data). ---
+echo "=== -fold regional bootstrap == dense + per-locus outputs ==="
+# cmp_region: header identical; per row same recipient + num.regions; the per-pop
+# region totals (and sums-of-squares) within rel 1e-6. Same line/column count.
+cmp_region() { # ref prefix label
+  local ok=1
+  for e in regionchunkcounts regionsquaredchunkcounts; do
+    if [ ! -f "$2.$e.out" ]; then echo "    MISSING (fold): $e"; ok=0; continue; fi
+    if [ ! -f "$1.$e.out" ]; then echo "    MISSING (dense): $e"; ok=0; continue; fi
+    awk '
+      function abs(x){return x<0?-x:x}
+      FNR==NR{ nf[FNR]=NF; for(i=1;i<=NF;i++) v[FNR,i]=$i; refn=FNR; next }
+      { candn=FNR;
+        if(NF!=nf[FNR]) bad=1;                                   # same column count
+        for(i=1;i<=NF;i++){
+          if($i ~ /[nN][aA][nN]|[iI][nN][fF]/){ bad=1 }
+          else if($i ~ /^-?[0-9.]+$/ && v[FNR,i] ~ /^-?[0-9.]+$/){
+            d=abs(($i+0)-(v[FNR,i]+0)); rel=(abs(v[FNR,i]+0)>1?d/abs(v[FNR,i]+0):d);
+            if(rel>1e-6) bad=1;
+          } else if(v[FNR,i]!=$i){ bad=1 } } }
+      END{ if(refn!=candn) bad=1; exit bad?1:0 }' "$1.$e.out" "$2.$e.out" \
+      || { echo "    DIFFER: $e"; ok=0; }
+  done
+  if [ $ok -eq 1 ]; then echo "  PASS  $3"; else echo "  FAIL  $3"; fail=1; fi
+}
 env OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" -t "$ID" -f "$POP" 0 0 \
-    -s 0 -i 0 -k 5 -n "$NE" -M "$MUT" -fold -o "$TMP/sup" >/dev/null 2>&1
-if [ -f "$TMP/sup.regionchunkcounts.out" ] || [ -f "$TMP/sup.regionsquaredchunkcounts.out" ]; then
-  echo "  FAIL  regional files present under -fold"; fail=1
-else echo "  PASS  regional files absent under -fold"; fi
+    -s 0 -i 0 -k 5 -n "$NE" -M "$MUT"       -o "$TMP/reg_d" >/dev/null 2>&1
+env OMP_NUM_THREADS=1 "$FS" cp -g "$D/win.phase" -r "$D/win.recom" -t "$ID" -f "$POP" 0 0 \
+    -s 0 -i 0 -k 5 -n "$NE" -M "$MUT" -fold -o "$TMP/reg_f" >/dev/null 2>&1
+cmp_region "$TMP/reg_d" "$TMP/reg_f" "fold regional == dense   [-k 5]"
 # -b (.copyprobsperlocus, per-locus per-pop copy posterior) and -d (.transitionprobs,
 # per-locus transition prob) ARE produced by the fold, byte-identical to the dense.
 gzcmp() { # ext label  (compares <prefix>.ext.gz under $TMP/bd_d vs $TMP/bd_f)

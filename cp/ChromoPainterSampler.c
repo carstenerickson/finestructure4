@@ -598,7 +598,8 @@ double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char *
        copy-proportion EM update) and the forward log-likelihood, so -fold drives
        the full -i N -ip -im -in -iM EM loop. Per-pop totals are exact, distributed
        uniformly within each donor pop so the per-pop output totals are reproduced.
-       (regional bootstrap + samples are not produced.) */
+       The regional bootstrap (.regionchunkcounts / .regionsquaredchunkcounts) and -s
+       samples are also produced - the fold is a strict superset of the dense. */
     if(*p_Nloci < 2){ fprintf(Par->out,"ERROR: -fold requires at least 2 loci. Exiting...\n"); stop_on_error(1,Par->errormode,Par->err); }
     double *fpp=calloc(ndonorpops,sizeof(double)), *fdiff=calloc(ndonorpops,sizeof(double)), *flen=calloc(ndonorpops,sizeof(double));
     double *fstart=calloc(ndonorpops,sizeof(double));
@@ -617,7 +618,9 @@ double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char *
     int *fsamp = (fsTOT>0) ? malloc((size_t)fsTOT*(*p_Nloci)*sizeof(int)) : NULL;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
                   copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops,
-                  Par->fold_ustar, fpp, fstart, fdiff, flen, &N_e_new, &foldloglik, etp_out, ecp_out, fsTOT, fsamp, &tb, &tf, Par->fold_retain_panel);
+                  Par->fold_ustar, fpp, fstart, fdiff, flen, &N_e_new, &foldloglik, etp_out, ecp_out,
+                  Par->region_size, regional_chunk_count_sum_final, regional_chunk_count_sum_squared_final, &num_regions,
+                  fsTOT, fsamp, &tb, &tf, Par->fold_retain_panel);
     Alphasum = foldloglik;
     /* write the sampled paths to .samples.out.gz (same format as the dense; the
        per-recipient "HAP h+1 label" header line is written in the common driver). */
@@ -654,8 +657,10 @@ double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char *
       if(finalrun){ copy_prob_new[i]=copy_prob[i]; copy_prob_newSTART[i]=copy_probSTART[i]; }
       else { copy_prob_new[i]=(cntp[p]>0)?(fpp[p]-fstart[p])/cntp[p]:0.0;
              copy_prob_newSTART[i]=(cntp[p]>0)?fstart[p]/cntp[p]:0.0; } }
-    for(i=0;i<ndonorpops;i++){ regional_chunk_count_sum_final[i]=0.0; regional_chunk_count_sum_squared_final[i]=0.0; snp_info_measure[i]=0.0; }
-    num_regions=0;
+    /* regional_chunk_count_sum_final / _squared_final and num_regions are now filled
+       by the fold itself (the regional bootstrap is reproduced). Keep zeroing the dead
+       snp_info_measure diagnostic only. */
+    for(i=0;i<ndonorpops;i++){ snp_info_measure[i]=0.0; }
     if(cpfold_env) fprintf(Par->out,"[CPFOLD-prod] N=%d K=%d Ustar=%d N_e=%.2f  fold=%.2f ms (+grouping %.2f ms)\n",*p_Nloci,*p_Nhaps,Par->fold_ustar,N_e_new,tf*1e3,tb*1e3);
     free(fpp); free(fdiff); free(flen); free(fstart); free(cntp);
   } else {
@@ -685,7 +690,8 @@ double ** sampler(double ** copy_prob_new_mat, signed char * newh, signed char *
     double t_build=0, t_fold=0, Ne_fold=0, ll_fold=0;
     cpfold_perpop(newh, existing_h, *p_Nhaps, *p_Nloci, TransProb, MutProb_vec,
                   copy_prob, copy_probSTART, pos, lambda, delta, p_rhobar, pop_vec, ndonorpops, Ustar,
-                  ccfold, NULL, cdfold, clfold, &Ne_fold, &ll_fold, NULL, NULL, 0, NULL, &t_build, &t_fold, 0);
+                  ccfold, NULL, cdfold, clfold, &Ne_fold, &ll_fold, NULL, NULL,
+                  0.0, NULL, NULL, NULL, 0, NULL, &t_build, &t_fold, 0);
     double mre=0,mrd=0,mrl=0; for(int p=0;p<ndonorpops;p++){
       double e=fabs(ccfold[p]-ccdense[p])/(fabs(ccdense[p])+1e-300); if(e>mre)mre=e;
       double d=fabs(cdfold[p]-cddense[p])/(fabs(cddense[p])+1e-300); if(d>mrd)mrd=d;

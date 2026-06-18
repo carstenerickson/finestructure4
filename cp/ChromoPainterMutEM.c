@@ -598,16 +598,11 @@ int chromopainter(int argc, char *argv[])
   fprintf(Par->out,"Assigning parameters from command line\n");
   assignParameters(Par,Infiles,Outfiles,argc,argv);
 
-  /* -fold cannot produce the per-region BOOTSTRAP (it needs per-region resampling
-     the block fold dissolves). Suppress the default-on regional files so they are
-     ABSENT rather than written as zeros (a zero .regionsquaredchunkcounts.out
-     silently collapses chromocombine's c estimate). The per-locus -b/-d outputs
-     ARE produced by the fold (per-pop copy posterior + per-locus transition prob).
-     Done before openOutfiles so the regional files are never created. */
-  if(Par->use_fold){
-    Outfiles->usingFile[6]=0;   /* .regionchunkcounts.out */
-    Outfiles->usingFile[7]=0;   /* .regionsquaredchunkcounts.out */
-  }
+  /* -fold now reproduces the per-region bootstrap (.regionchunkcounts /
+     .regionsquaredchunkcounts) directly in the block fold - it replicates the dense's
+     per-locus region banking, FP-equivalent (~1e-9), so chromocombine's c estimate is
+     preserved. The regional files are therefore left on (no suppression), making -fold
+     a strict superset of the dense for the chromocombine / fineSTRUCTURE workflow. */
 
   if(Par->vverbose) fprintf(Par->out,"Opening output files\n");
   openOutfiles(Outfiles);

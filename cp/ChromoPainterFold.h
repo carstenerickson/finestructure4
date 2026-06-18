@@ -43,12 +43,23 @@ static inline double cp_emis(int r, int d, double m){
    does not double-free. Pass 0 to rebuild-and-free the buffer per call without touching
    existing_h (the default, required when the panel changes between recipients). Call
    cpfold_cleanup() once at teardown to release a retained buffer. */
+/* Regional bootstrap (optional, all NULL/0 to skip): with out_regfinal/out_regsq
+   (npop) and out_numreg, the fold replicates the dense's per-region chunk-count
+   banking - the cumulative per-locus total is banked into a region every time it
+   crosses region_size (rounding 1e-7), the per-pop sums and sums-of-squares
+   accumulate into out_regfinal/out_regsq, and out_numreg counts the regions. The
+   final partial region is dropped, matching the dense. FP-equivalent (~1e-9) to the
+   dense, NOT bit-identical: a boundary can land one locus off the dense, so the raw
+   per-region files may differ - the conserved quantities are the aggregate sum and
+   chromocombine's c. */
 void cpfold_perpop(signed char *newh, signed char **existing_h, int nhaps, int nloci,
                    double *TransProb, double *MutProb_vec, double *copy_prob, double *copy_probSTART,
                    double *pos, double *lambda, double delta, double rhobar,
                    int *pop_vec_in, int ndonorpops, int Ustar,
                    double *out_ccpop, double *out_start, double *out_ndiff, double *out_nlen, double *out_Ne,
-                   double *out_loglik, double *out_etp, double *out_ecp, int samplesTOT, int *out_samples,
+                   double *out_loglik, double *out_etp, double *out_ecp,
+                   double region_size, double *out_regfinal, double *out_regsq, int *out_numreg,
+                   int samplesTOT, int *out_samples,
                    double *t_build, double *t_fold, int retain_panel);
 
 /* Free the retained locus-major donor buffer (no-op if none). Idempotent. */
